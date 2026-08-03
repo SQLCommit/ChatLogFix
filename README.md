@@ -56,10 +56,6 @@ Two details worth knowing, both of which are stock behaviour and unaffected by t
 - It changes **nothing** about how much history the game retains. It only fills the window you are already looking at.
 - The ring is a **snapshot**. It only updates live while you are sitting at the newest line; scrolled back, what you see is frozen until the next rebuild.
 
-## Version history
-
-See **CHANGELOG.md**.
-
 ## Thanks
 
 - **The Ashita Team** - atom0s, thorny, and the Ashita Discord community

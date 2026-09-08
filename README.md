@@ -1,7 +1,7 @@
 # ChatLogFix v1.2 - Full-Height Chat Log + Chat Thread-Safety for Ashita v4
 
 Fills the expanded chat log (fulllog) to the full height of its window, and serializes FFXI's
-non-thread-safe chat fixing the chat buffer curruption.
+non-thread-safe chat fixing the chat buffer corruption.
 
 ## Features
 

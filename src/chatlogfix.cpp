@@ -1,5 +1,6 @@
 /**
- * chatlogfix - see chatlogfix.hpp for what the bug is and how the fix works.
+ * chatlogfix - base fix (the two stop-value bytes below), fill mode (the ring constants and the six
+ * relocated blocks), and chat serialization (chatserial.cpp). README.md explains each.
  */
 #include "chatlogfix.hpp"
 
@@ -434,7 +435,10 @@ void chatlogfix::Fail(const char* fmt, ...)
 
     if (m_ToldHowToReport) return;
     m_ToldHowToReport = true;
-    Print(k_colFail, "Nothing was patched - this client build is not one chatlogfix knows.");
+    if (m_Patched)
+        Print(k_colFail, "The base fix is ON; the step that failed is above. Run " HL("/clf status") " for the state.");
+    else
+        Print(k_colFail, "Nothing was patched - this client build is not one chatlogfix knows.");
 }
 
 void chatlogfix::FailLoud(const char* fmt, ...)
@@ -632,7 +636,8 @@ bool chatlogfix::Resolve(void)
 }
 
 // ================================================================================================
-// 4K MODE
+// FILL MODE - engages only on a chat window holding more than 99 rows; constants up to 127 rows,
+// relocation beyond that
 // ================================================================================================
 
 uintptr_t chatlogfix::Anchor(int idx)
@@ -660,19 +665,37 @@ int chatlogfix::WindowRows(void)
 
 bool chatlogfix::RingResetState(void)
 {
+    // The 33 constants and the six relocated blocks are CODE shared by every chat window, but
+    // logwindo and logwin2 each own a ring that fills independently (re/chat-windows.md: adjacent
+    // gslots, one routine drives both).
     const uintptr_t a = Anchor(RA_GSLOT);
     if (a == 0) return false;
-    uint32_t slot = 0, box = 0, ring = 0;
+    uint32_t slot = 0;
     if (!safe_read(a + 1, &slot, 4) || slot < 0x10000) return false;
-    if (!safe_read(slot, &box, 4)) return false;
-    if (box < 0x10000) return true;
-    if (!safe_read(box + 0x18, &ring, 4)) return false;
-    if (ring < 0x10000) return true;
-    uint16_t z = 0;
-    WriteAt(ring + 0x14, &z, 2);                       // newest
-    WriteAt(ring + 0x16, &z, 2);                       // oldest
-    WriteAt(ring + 0x1a, &z, 2);                       // count
-    return true;
+    // Reset one window's ring indices (newest/oldest/count) and read them back. A window whose box
+    // does not exist yet (0) is fine; a ring we can see but cannot zero is not.
+    auto reset_one = [this](uintptr_t s) -> bool
+    {
+        uint32_t box = 0, ring = 0;
+        if (!safe_read(s, &box, 4)) return false;
+        if (box < 0x10000) return true;
+        if (!safe_read(box + 0x18, &ring, 4)) return false;
+        if (ring < 0x10000) return true;
+        const uint16_t z = 0;
+        static const uint32_t offs[3] = { 0x14, 0x16, 0x1a };   // newest, oldest, count
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!WriteAt(ring + offs[i], &z, 2)) return false;
+            uint16_t chk = 0xFFFF;
+            if (!safe_read(ring + offs[i], &chk, 2) || chk != 0) return false;
+        }
+        return true;
+    };
+    const bool one = reset_one(slot);       // logwindo
+    const bool two = reset_one(slot + 4);   // logwin2 (adjacent gslot)
+    if (!one) Log(true, "ring reset: chat window 1 could not be zeroed");
+    if (!two) Log(true, "ring reset: chat window 2 could not be zeroed");
+    return one && two;
 }
 
 bool chatlogfix::WriteAt(uintptr_t addr, const void* src, size_t len)
@@ -824,8 +847,8 @@ void chatlogfix::AutoApply(void)
     const int rows = WindowRows();
     if (rows < 0)
     {
-        Fail("Could not measure the chat window, so the log may not fill it. Reload chatlogfix once "
-             "you are in game.");
+        Fail("Base fix ON, fill mode not measured: the chat window has no size yet. Reload chatlogfix once "
+             "you are in game to fill a tall window.");
         return;
     }
     if (rows <= k_ringStock - 1) return;
@@ -975,24 +998,37 @@ bool chatlogfix::CaveInstall(int n, int fill)
         uint8_t chk[32];
         if (!safe_read(site[b], chk, k_blocks[b].len) || memcmp(chk, jmp, k_blocks[b].len) != 0)
         {
-            for (int j = 0; j <= b; ++j)
-                if (m_BlkAddr[j] != 0)
-                { WriteAt(m_BlkAddr[j], m_BlkOrig[j], k_blocks[j].len); m_BlkAddr[j] = 0; }
-            VirtualFree(m_Cave, 0, MEM_RELEASE);
-            m_Cave = nullptr;
-            Fail("Fill mode: could not redirect %s - rolled back, nothing is patched.", k_blocks[b].name);
+            const int left = CaveRemove();
+            if (left == 0)
+                Fail("Fill mode: could not redirect %s - rolled back, nothing is patched.", k_blocks[b].name);
+            else
+                FailLoud("Fill mode: could not redirect %s, and %d block(s) of the rollback did not take - "
+                         "the cave is kept so no jump points at freed memory. Run " HL("/clf diag") " and report it.",
+                         k_blocks[b].name, left);
             return false;
         }
     }
     return true;
 }
 
-void chatlogfix::CaveRemove(void)
+// Restore every relocated block and read each back. Returns how many are STILL redirected; the cave
+// is freed only when that is zero.
+int chatlogfix::CaveRemove(void)
 {
+    int left = 0;
     for (int b = 0; b < BK_COUNT; ++b)
-        if (m_BlkAddr[b] != 0)
-        { WriteAt(m_BlkAddr[b], m_BlkOrig[b], k_blocks[b].len); m_BlkAddr[b] = 0; }
-    if (m_Cave != nullptr) { VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr; }
+    {
+        if (m_BlkAddr[b] == 0) continue;
+        uint8_t chk[32];
+        if (WriteAt(m_BlkAddr[b], m_BlkOrig[b], k_blocks[b].len)
+            && safe_read(m_BlkAddr[b], chk, k_blocks[b].len)
+            && memcmp(chk, m_BlkOrig[b], k_blocks[b].len) == 0)
+            m_BlkAddr[b] = 0;
+        else
+            ++left;
+    }
+    if (left == 0 && m_Cave != nullptr) { VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr; }
+    return left;
 }
 
 bool chatlogfix::FillReloc(bool on)
@@ -1018,8 +1054,11 @@ bool chatlogfix::FillReloc(bool on)
             if (ring_read_at(m_RingAddr[i], k) != m_RingOrig[i]) ++bad;
             m_RingAddr[i] = 0;
         }
-        CaveRemove();
-        if (m_Patched && Ready())
+        const int left = CaveRemove();
+        bad += left;
+        // The two base-fix bytes sit INSIDE code a relocated block replaced; writing them while a
+        // block is still a jmp would corrupt that jmp's displacement. Only when every block is back.
+        if (left == 0 && m_Patched && Ready())
         {
             const uint8_t v = k_target;
             for (int b = 0; b < 2; ++b)
@@ -1028,12 +1067,13 @@ bool chatlogfix::FillReloc(bool on)
                 if (*reinterpret_cast<const uint8_t*>(m_Site[b]) != v) ++bad;
             }
         }
-        m_RelocOn = false;
-        m_RelocN  = 0;
+        m_RelocOn = (left > 0);   // stays on while a block is still redirected; the cave is retained for it
+        if (left == 0) m_RelocN = 0;
         if (bad == 0) Print(k_colInfo, "Fill mode " HL("OFF") " - ring back to %d records, fill back to %d.",
                             k_ringStock, k_target);
-        else          FailLoud("Fill mode restore INCOMPLETE - %d site(s) did not take. "
-                           "Run " HL("/clf diag") " and report it.", bad);
+        else          FailLoud("Fill mode restore INCOMPLETE - %d site(s) did not take%s. "
+                           "Run " HL("/clf diag") " and report it.", bad,
+                           left > 0 ? " (relocated block(s) still redirected; the cave is kept so they stay valid)" : "");
         return bad == 0;
     }
 
@@ -1106,10 +1146,15 @@ bool chatlogfix::FillReloc(bool on)
                 else { uint8_t v = static_cast<uint8_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 1); }
                 m_RingAddr[j] = 0;
             }
-            CaveRemove();
-            m_RelocOn = false;
-            Fail("Fill mode: write failed at %s+0x%X - rolled back, nothing is patched.",
-                 k_anchors[k_ringSites[i].anchor].name, k_ringSites[i].off);
+            const int left = CaveRemove();
+            m_RelocOn = (left > 0);
+            if (left == 0)
+                Fail("Fill mode: write failed at %s+0x%X - rolled back, nothing is patched.",
+                     k_anchors[k_ringSites[i].anchor].name, k_ringSites[i].off);
+            else
+                FailLoud("Fill mode: write failed at %s+0x%X, and %d relocated block(s) could not be restored - "
+                         "the cave is kept so they stay valid. Run " HL("/clf diag") " and report it.",
+                         k_anchors[k_ringSites[i].anchor].name, k_ringSites[i].off, left);
             return false;
         }
     }
@@ -1195,6 +1240,15 @@ bool chatlogfix::Restore(void)
                  "now, and writing them would corrupt it. Zone or relog, then unload again.");
         return false;
     }
+    for (int b = 0; b < BK_COUNT; ++b)
+        if (m_BlkAddr[b] != 0)
+        {
+            // A relocated block survived a failed install or teardown: the base-fix bytes lie inside
+            // the jmp it still holds, so writing them would corrupt the jmp. Leave everything as is.
+            FailLoud("The base fix was left applied too: a relocated block is still redirected and the two "
+                     "bytes sit inside it. Restart the game to clear it.");
+            return false;
+        }
     if (m_ConstOn) FillConst(false);
     if (!m_Dirty[0] && !m_Dirty[1]) return false;
 
@@ -1226,6 +1280,14 @@ bool chatlogfix::Restore(void)
     return allBack;
 }
 
+void chatlogfix::SerialLog(void* ctx, bool warn, const char* msg)
+{
+    chatlogfix* self = reinterpret_cast<chatlogfix*>(ctx);
+    if (self == nullptr) return;
+    if (warn) self->Print(k_colWarn, "%s", msg);
+    else      self->Log(false, "%s", msg);
+}
+
 bool chatlogfix::Initialize(IAshitaCore* core, ILogManager* logger, uint32_t id)
 {
     m_Core = core;
@@ -1248,11 +1310,17 @@ bool chatlogfix::Initialize(IAshitaCore* core, ILogManager* logger, uint32_t id)
             : "Apply() failed without recording a reason (this is a chatlogfix bug)");
     }
     AutoApply();
+
+    // Serialize FFXiMain's chat append vs draw.
+    // Independent of the fulllog fill; installs its own SIG-located lock or logs why it did not.
+    ChatSerial_Install(&chatlogfix::SerialLog, this);
+
     return true;
 }
 
 void chatlogfix::Release(void)
 {
+    ChatSerial_Remove();
     if (m_RelocOn)  FillReloc(false);
     if (m_ConstOn) FillConst(false);
     if (!m_Dirty[0] && !m_Dirty[1])
@@ -1331,6 +1399,10 @@ void chatlogfix::Status(bool full, bool terse)
             Log(false, "FFXiMain build 0x%08X, branch A RVA 0x%06X, branch B RVA 0x%06X.",
                   m_ImgStamp, Rva(m_Site[0]), Rva(m_Site[1]));
     }
+
+    if (ChatSerial_Active()) Print(k_colInfo, "Chat serialization " HL("ON") ".");
+    else                     Print(k_colInfo, "Chat serialization " HL("OFF") ".");
+    if (full) ChatSerial_Diag(&chatlogfix::SerialLog, this);   // detail -> log/diag file
 
     if (full)
     {

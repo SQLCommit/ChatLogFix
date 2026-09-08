@@ -1,10 +1,21 @@
 # Changelog
 
+## 1.2
+
+Adds **chat serialization**: the client's chat buffer is written from one thread while the main
+thread draws it, and a burst of colored text can make the buffer grow mid-draw. One recursive
+spinlock now makes the append (writer) and the draw (reader) take turns, which stops the flood crash
+and the garbled/blank chat lines.
+
+- Teardown resets BOTH chat windows' rings (logwindo and logwin2) with read-back before narrowing the
+  ring size; a ring that cannot be zeroed refuses the narrowing.
+- The relocated-block cave is freed only when every block reads back as stock; a surviving block keeps
+  the cave and blocks the base-fix restore, instead of leaving a jump into freed memory.
+
 ## 1.1
 
 Adds **fill mode**, which fills chat windows taller than the base fix can reach. The base fix is
-unchanged - the same two bytes, resolved the same way. Load the plugin and you get exactly what 1.0
-did, plus this where it helps.
+unchanged - the same two bytes, resolved the same way.
 
 ### Fill mode
 

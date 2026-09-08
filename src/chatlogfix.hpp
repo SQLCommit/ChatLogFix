@@ -1,5 +1,8 @@
 /**
- * chatlogfix - fills the expanded chat log (fulllog) to the full height of its window.
+ * chatlogfix - fills the expanded chat log (fulllog) to the full height of its window (the base fix,
+ * plus fill mode for windows taller than 99 rows), and serializes the client's chat append against its
+ * chat draw with a recursive spinlock (chatserial) so a colored-text flood can no longer corrupt the
+ * chat buffer.
  */
 #define HL(s) "\x11" s "\x12"
 
@@ -7,6 +10,7 @@
 #define CHATLOGFIX_HPP_INCLUDED
 
 #include "Ashita.h"
+#include "chatserial.hpp"
 
 #include <cstdint>
 #include <windows.h>
@@ -88,7 +92,7 @@ class chatlogfix final : public IPlugin
     bool      FillConst(bool on);   // mechanism 1: constants only, no code moved
     bool      FillReloc(bool on);   // mechanism 2: six blocks relocated
     bool      CaveInstall(int n, int fill);   // resolve, verify and relocate all six blocks
-    void      CaveRemove(void);               // restore all six, THEN free
+    int       CaveRemove(void);               // restore all six (verified); free ONLY when none remain; returns the count still redirected
 
     bool Resolve(void);
     bool Ready(void) const { return m_Site[0] != 0 && m_Site[1] != 0; }
@@ -104,6 +108,7 @@ class chatlogfix final : public IPlugin
     void Fail(const char* fmt, ...);
     void FailLoud(const char* fmt, ...);
     void Log(bool warn, const char* fmt, ...);
+    static void SerialLog(void* ctx, bool warn, const char* msg);
 
     uint32_t Rva(uintptr_t addr) const
     { return (m_Base != 0 && addr >= m_Base) ? static_cast<uint32_t>(addr - m_Base) : 0; }
@@ -120,6 +125,7 @@ public:
     // Ring modes first: their restore resets the ring indices, which needs the ring still reachable.
     ~chatlogfix(void)
     {
+        ChatSerial_Remove();
         if (m_RelocOn)  { m_Core = nullptr; FillReloc(false); }
         if (m_ConstOn) { m_Core = nullptr; FillConst(false); }
         if (m_Dirty[0] || m_Dirty[1]) { m_Core = nullptr; Restore(); }
@@ -127,9 +133,9 @@ public:
 
     const char* GetName(void) const override { return "chatlogfix"; }
     const char* GetAuthor(void) const override { return "SQLCommit"; }
-    const char* GetDescription(void) const override { return "Fills the expanded chat log to the full window height."; }
+    const char* GetDescription(void) const override { return "Fills the expanded chat log, and serializes chat append vs draw."; }
     const char* GetLink(void) const override { return ""; }
-    double GetVersion(void) const override { return 1.1; }
+    double GetVersion(void) const override { return 1.2; }
     double GetInterfaceVersion(void) const override { return ASHITA_INTERFACE_VERSION; }
     int32_t GetPriority(void) const override { return 0; }
     uint32_t GetFlags(void) const override

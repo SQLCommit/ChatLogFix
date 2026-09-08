@@ -1,18 +1,17 @@
-# ChatLogFix v1.1 - Full Height Chat Log for Ashita v4
+# ChatLogFix v1.2 - Full-Height Chat Log + Chat Thread-Safety for Ashita v4
 
-Fills the expanded chat log (fulllog) to the full height of its window instead of stopping halfway.
+Fills the expanded chat log (fulllog) to the full height of its window, and serializes FFXI's
+non-thread-safe chat fixing the chat buffer curruption.
 
-## Why this exists
+## Features
 
-FFXI wipes the chat render ring on every view reset and then repopulates it with only **50** lines. The ring holds **100**. The gap fills in on its own as new chat arrives, which is why the bug feels intermittent and is always worst right after you open or tab.
+- **Base fix** - the fulllog rebuild stops at 50 lines; it now stops at 99, which fills any window up
+  to 1679px tall.
+- **Fill mode** - on taller windows, raises the chat ring itself to match the window, up to 200 records.
+- **Chat serialization** - one lock so chat is never written while the game is drawing or growing the
+  buffer.
 
-The fix is one byte in each of the two branches of the view-reset:
-
-```
-cmp  dx, 50        ->        cmp  dx, 99
-```
-
-That is the entire change.
+Everything applies itself on load. There is nothing to configure.
 
 ## Requirements
 
@@ -26,8 +25,7 @@ Copy `chatlogfix.dll` into `Ashita-v4beta-main\plugins\`, then:
 /load chatlogfix
 ```
 
-The fix applies immediately on load. Add `/load chatlogfix` to your startup script to have it every
-session.
+Add `/load chatlogfix` to your startup script to have it every session.
 
 ## Commands
 
@@ -38,10 +36,38 @@ session.
 
 `/clf` for short.
 
-## What it does at your resolution
+## How it works
 
-You do not have to pick any of this as the plugin measures and decides. The chart is here so you can
-check it did the right thing. Your chat window holds `(viewport height / 16) - 5` rows.
+FFXI keeps chat in three layers:
+
+- a **store** of retained history, backed by 20 page files per window on disk
+- a 100-record **ring** holding what is currently on screen
+- the **view** you scroll
+
+### Base fix
+
+Every time the view resets - opening fulllog, switching tab, zoning - the ring is cleared and rebuilt
+from the store. The rebuild accumulates a running line count and stops once it reaches 50, so half the
+window is left empty. The gap fills in on its own as new chat arrives, which is why the bug feels
+intermittent and is always worst right after you open or tab.
+
+The fix is one byte in each of the two branches of the view-reset:
+
+```
+cmp  dx, 50        ->        cmp  dx, 99
+```
+
+Those two bytes are put back on unload.
+
+### Fill mode
+
+The base fix fills the ring to its capacity of 100 records, which completely fills any chat window of
+99 rows or fewer. A taller window is taller than the ring can fill: at 4K that is 130 rows against 99
+records, leaving 31 blank rows above the oldest line. Fill mode raises the ring itself to match the
+window, up to **200 records**.
+
+Your chat window holds `(viewport height / 16) - 5` rows. The plugin measures and decides; the chart
+is here so you can check it did the right thing.
 
 | Display | Window holds | Stock | Base fix alone | + fill mode |
 |---------|-------------:|------:|---------------:|-------------:|
@@ -55,63 +81,35 @@ check it did the right thing. Your chat window holds `(viewport height / 16) - 5
 | 5K (2880) | 175 rows | 50, 125 blank | 99, 76 blank | **175 - full** |
 | 8K (4320) | 265 rows | 50, 215 blank | 99, 166 blank | 199, **66 blank** |
 
-**In short:**
-
-| Viewport height | What you need |
-|-----------------|---------------|
-| up to **1679px** | nothing beyond the base fix. Fill mode declines silently - nothing is blank for it to fill. |
+| Viewport height | What happens |
+|-----------------|--------------|
+| up to **1679px** | the base fix already fills the window; fill mode declines. |
 | **1680 - 3279px** | fill mode engages and fills the window exactly. |
 | **3280px and up** | fill mode engages but stops at 199 lines; some rows stay blank. |
-
 
 That 199 cap is a hard one: 200 records is the size of the client's own ring allocation, and there is
 no larger number that is safe to write.
 
-## Fill mode
+**How it reaches past 127.** Six blocks of client code hold the ring's bound in a sign-extended 8-bit
+immediate, so 127 is the largest number that fits. Below that it writes constants and nothing else
+happens. At 128 and above it re-encodes those six blocks with 32-bit immediates in a block of memory it
+allocates, and replaces each original site with a jump to it. Four of the six wrap or normalise a ring
+index; the other two are the rebuild's own stop value, which is what decides how many lines a rebuild
+places. It takes the cheaper mechanism whenever that reaches, then says what it did. Every site is
+checked against its expected bytes before anything is written, the whole set rolls back if any single
+write does not take, and the allocated block is released only after all six sites are back to stock.
 
-The fix fills the render ring to its capacity of **100 records**, which completely fills any chat
-window of 99 rows or fewer. That covers every display up to 1679px tall, so at 1080p and 1440p there
-is no blank space left at all.
+### Chat serialization
 
-A taller window is taller than the ring can fill: at 4K that is 130 rows against 99 records, leaving
-31 blank rows above the oldest line.
+Every bit of color in FFXI chat is an escape code stored in the chat buffer, so a burst of
+heavily-colored text fills that buffer fast. Chat is written to it on a **background thread** while the
+game's **main thread is drawing the same buffer every frame**. When a write lands in the middle of the
+game's own work on that buffer - drawing it, or growing it to hold more - it corrupts: the client
+crashes, or lines render garbled or blank.
 
-Fill mode raises the ring itself to match your window, up to **200 records**.
-
-**It applies itself.** On load the plugin measures the window and does whatever that window needs, so
-there is nothing to turn on and nothing to configure.
-
-### How it reaches past 127
-
-There is a ceiling in the way, and it is worth knowing about because it decides how much of your
-client gets touched.
-
-Six blocks of client code hold the ring's bound in a **sign-extended 8-bit immediate**, so 127 is
-simply the largest number that fits in the space available. Below that it writes constants and
-nothing else happens. At 128 and above there is no number to write, so it re-encodes those six blocks
-with 32-bit immediates in a block of memory it allocates, and replaces each original site with a jump
-to it.
-
-Four of the six wrap or normalise a ring index. **The other two are the rebuild's own stop value**,
-which is what decides how many lines a rebuild places - raising the ring without those two would buy
-capacity nothing can fill.
-
-You do not choose between these. It measures the window and takes the cheaper one whenever that
-reaches, then says what it did. Either way every site is checked against its expected bytes
-before anything is written, the whole set rolls back if any single write does not take, and the
-allocated block is released only after all six sites are back to stock.
-
-## How It Works
-
-The base fix changes two bytes of client-side display logic in this process's memory, and puts them back when unloaded. (Fill mode changes more - see above.)
-
-FFXI keeps chat in three layers:
-
-- a **store** of retained history, backed by 20 page files per window on disk
-- a 100-record **ring** holding what is currently on screen
-- the **view** you scroll
-
-Every time the view resets - opening fulllog, switching tab, zoning - the ring is cleared and rebuilt from the store. The rebuild accumulates a running line count and stops once it reaches 50, so half the window is left empty. This plugin raises that stop value to 99.
+The plugin puts a lock on the buffer, so the two threads take turns and only one touches it at a time.
+It can't be corrupted mid-write, and both the crash and the garble stop. If a game update moves the code
+it patches, serialization turns itself off, says so in chat, and everything else keeps working.
 
 ## Version history
 

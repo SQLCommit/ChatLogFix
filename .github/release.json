@@ -1,0 +1,17 @@
+{
+  "name": "ChatLogFix",
+  "repository": "SQLCommit/ChatLogFix",
+  "dll": "chatlogfix.dll",
+  "buildOutput": "build/Release/chatlogfix.dll",
+  "docsFolder": "chatlogfix",
+  "docs": [
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "versionFile": "src/chatlogfix.hpp",
+  "versionPattern": "GetVersion\\s*\\([^)]*\\)[^{]*\\{\\s*return\\s+([0-9]+\\.[0-9]+)",
+  "ashitaSdkRef": "4171c74c8ddb2ca2a31654f199e6c1cee40d7256",
+  "ashitaInterface": "4.30"
+}

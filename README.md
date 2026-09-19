@@ -1,7 +1,7 @@
-# ChatLogFix v1.2 - Full-Height Chat Log + Chat Thread-Safety for Ashita v4
+# ChatLogFix v1.3 - Full-Height Chat Log + Chat Thread-Safety for Ashita v4
 
 Fills the expanded chat log (fulllog) to the full height of its window, and serializes FFXI's
-non-thread-safe chat fixing the chat buffer corruption.
+non-thread-safe chat, fixing the chat buffer corruption.
 
 ## Features
 
@@ -15,11 +15,14 @@ Everything applies itself on load. There is nothing to configure.
 
 ## Requirements
 
-- Ashita 4.3.1.2 (interface version 4.30) - the version ChatLogFix was built and tested against.
+- Ashita 4.3.1.2 or later with plugin interface 4.30 - built against 4.3.1.2's SDK and tested on 4.3.2.1.
 
 ## Installation
 
-Copy `chatlogfix.dll` into `Ashita-v4beta-main\plugins\`, then:
+Download `ChatLogFix-vX.Y_Interface-N.NN.zip` from [Releases](https://github.com/SQLCommit/ChatLogFix/releases) - the one whose
+`Interface-N.NN` matches your Ashita's plugin interface (each release's notes say which) - and extract it into your
+Ashita folder. It adds `chatlogfix.dll` to `plugins\` and its docs to `docs\chatlogfix\`. GitHub's
+"Source code" zip is not the plugin. Then:
 
 ```
 /load chatlogfix
@@ -32,7 +35,7 @@ Add `/load chatlogfix` to your startup script to have it every session.
 | Command | Description |
 |---------|-------------|
 | `/chatlogfix status` | What it is doing right now |
-| `/chatlogfix diag` | Write a full report to `logs\chatlogfix_diag.log` |
+| `/chatlogfix diag` | Write a full report to your character's log |
 
 `/clf` for short.
 
@@ -57,7 +60,7 @@ The fix is one byte in each of the two branches of the view-reset:
 cmp  dx, 50        ->        cmp  dx, 99
 ```
 
-Those two bytes are put back on unload.
+Those two bytes stay in until the game closes (see Unloading).
 
 ### Fill mode
 
@@ -96,8 +99,9 @@ happens. At 128 and above it re-encodes those six blocks with 32-bit immediates 
 allocates, and replaces each original site with a jump to it. Four of the six wrap or normalise a ring
 index; the other two are the rebuild's own stop value, which is what decides how many lines a rebuild
 places. It takes the cheaper mechanism whenever that reaches, then says what it did. Every site is
-checked against its expected bytes before anything is written, the whole set rolls back if any single
-write does not take, and the allocated block is released only after all six sites are back to stock.
+checked against its expected bytes before anything is written, and the whole set rolls back if any single
+write does not take. The allocated block is never released: it stays, with the rest of ChatLogFix's
+changes, until the game closes (see Unloading).
 
 ### Chat serialization
 
@@ -111,9 +115,19 @@ The plugin puts a lock on the buffer, so the two threads take turns and only one
 It can't be corrupted mid-write, and both the crash and the garble stop. If a game update moves the code
 it patches, serialization turns itself off, says so in chat, and everything else keeps working.
 
+### Files
+
+The log is one file per character:
+`logs\chatlogfix\<Name>_<id>\chatlogfix.log` in the Ashita folder.
+Before you log in it writes to a startup file in `logs\chatlogfix\`, which moves into your character's log at
+login. Each log keeps its newest 1 MB; older lines are trimmed away. Several game clients can run from one Ashita folder
+at once without losing a line.
+
+`/clf diag` writes a full report into your character's log. If something goes wrong, run it and send that log.
+
 ## Version history
 
-See **CHANGELOG.md**.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Thanks
 

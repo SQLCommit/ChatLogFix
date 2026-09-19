@@ -9,6 +9,7 @@
  */
 #include "chatserial.hpp"
 #include "chatserial_cave.hpp"
+#include "freeze.hpp"
 
 #include <windows.h>
 #include <cstdarg>
@@ -46,11 +47,15 @@ namespace
     };
 
     uint8_t* g_cave = nullptr;
-    struct Site { uintptr_t addr; uint8_t saved[5]; };
+    // saved = what a clean removal restores; installed = the jmp we wrote (removal only writes over
+    // exactly that); entry = an entry site (removal touches entries only, exits stay); done = restored.
+    struct Site { uintptr_t addr; uint8_t saved[5]; uint8_t installed[5]; bool entry; bool done; };
     Site     g_sites[5];
     int      g_nSites = 0;
     bool     g_active = false;
     bool     g_adopted = false;         // this load reused the cave a previous load left behind
+    bool     g_pinned = false;          // the DLL pinned itself (before its first write); never cleared
+    uintptr_t g_caveLive = 0;           // a cave the exits point into (this load's, or adopted): reachable until the game closes
     ChatSerialLog g_log = nullptr; void* g_ctx = nullptr;
     const size_t k_releaseHead = 35;    // bytes before the replicated exit in a release stub (see the builder)
 
@@ -73,6 +78,11 @@ namespace
     }
     uintptr_t g_base = 0;
     uint32_t  g_writerRva = 0, g_readerRva = 0;
+    uintptr_t g_went = 0, g_rent = 0;     // the writer/reader entries once resolved (kept after removal)
+    // The spans a thread must be out of while an entry or exit changes: the whole writer and reader
+    // bodies (the scan ranges used for the exits, a superset of the Sep-10 bodies 0x3A3 and 0x296) and
+    // the cave. A thread inside the body may hold the lock or sit on a stolen instruction.
+    const uint32_t k_writerSpan = 0x600, k_readerSpan = 0x400;
 
     void logf(ChatSerialLog log, void* ctx, bool warn, const char* fmt, ...)
     {
@@ -195,6 +205,7 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
     const uintptr_t rent = find_unique(base, size, k_sigReader, sizeof(k_sigReader));
     if (!went) { logf(log,ctx,true,"chatserial: writer sig not found/unique (client build unknown) - NOT installed"); return false; }
     if (!rent) { logf(log,ctx,true,"chatserial: reader sig not found/unique (client build unknown) - NOT installed"); return false; }
+    g_went = went; g_rent = rent;   // known from here on, for the freeze ranges even if this install stops below
 
     // load-time self-check.
     {
@@ -214,7 +225,7 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
                         || memcmp(reinterpret_cast<const void*>(rexits[0]), k_rexitPat, sizeof(k_rexitPat)) != 0
                         || memcmp(reinterpret_cast<const void*>(rexits[1]), k_rexitPat, sizeof(k_rexitPat)) != 0;
 
-    // The exits are never restored at unload (see ChatSerial_Remove), so after the first load in a
+    // The exits are never restored at unload, so after the first load in a
     // client session they already point into a cave a previous load left behind. That cave is
     // ADOPTED -- same lock state, so a holder or waiter from before the reload keeps working -- if
     // and only if its code is byte-for-byte what this builder emits for that address. Anything else
@@ -259,6 +270,14 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
     }
     const uintptr_t ACQW = C + 16 + off[0], ACQR = C + 16 + off[1], RELW = C + 16 + off[2], REL8 = C + 16 + off[3];
 
+    // From the first byte written the DLL stays mapped for the life of the process (freeze.hpp).
+    g_pinned = PinThisModule();
+    if (!g_pinned)
+    {
+        if (!g_adopted) VirtualFree(cave, 0, MEM_RELEASE);   // never published: nothing can be in it
+        logf(log,ctx,true,"chatserial: could not pin the DLL, so nothing was patched (chat still works, the serialization is off)");
+        return false;
+    }
     g_cave = cave; g_nSites = 0; g_log = log; g_ctx = ctx;
     auto patch = [&](uintptr_t addr, uintptr_t target) -> bool
     {
@@ -272,20 +291,54 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
         uint8_t p[5]; p[0] = 0xe9;
         const uint32_t rel = (uint32_t)(target - (addr + 5));
         memcpy(p+1, &rel, 4);
+        memcpy(s.installed, p, 5);
+        s.entry = (addr == went || addr == rent);
+        s.done  = false;
         if (!mem_equals(addr, p, 5) && !write_bytes(addr, p, 5)) return false;   // adopted exits are already right
         ++g_nSites;
         return true;
     };
-    // Order matters: RELEASES first, ACQUIRES last.
-    const bool ok = patch(wexit, RELW) && patch(rexits[0], REL8) && patch(rexits[1], REL8)
-                 && patch(went, ACQW) && patch(rent, ACQR);
+    // The writes happen with every other thread stopped and none of them inside the writer, the
+    // reader or the cave: a 5-byte jmp over a 6-byte prologue, or over `sub esp; push ebx; push esi`,
+    // must never land under a thread part-way through those instructions. No logging in there.
+    CodeRange ranges[4]; size_t nr = 0;
+    { uintptr_t lo, hi; if (ModuleRangeOf(reinterpret_cast<const void*>(&ChatSerial_Install), lo, hi)) ranges[nr++] = CodeRange{lo, hi}; }
+    ranges[nr++] = CodeRange{C, C + 0x1000};
+    ranges[nr++] = CodeRange{went, went + k_writerSpan};
+    ranges[nr++] = CodeRange{rent, rent + k_readerSpan};
+    bool ok = false, ran = false;
+    int stranded = 0;
+    ran = WhenNoThreadIn(ranges, nr, 1000, [&]
+    {
+        // Order matters: RELEASES first, ACQUIRES last.
+        ok = patch(wexit, RELW) && patch(rexits[0], REL8) && patch(rexits[1], REL8)
+          && patch(went, ACQW) && patch(rent, ACQR);
+        // Same rule as removal: only ENTRY sites go back on failure, each verified; one that does not
+        // go back keeps its record so a later removal can retry it.
+        if (!ok)
+            for (int i = 0; i < g_nSites; ++i)
+            {
+                if (!g_sites[i].entry) continue;
+                if (mem_equals(g_sites[i].addr, g_sites[i].saved, 5) || (write_bytes(g_sites[i].addr, g_sites[i].saved, 5) && mem_equals(g_sites[i].addr, g_sites[i].saved, 5)))
+                    g_sites[i].done = true;
+                else
+                    ++stranded;
+            }
+    });
+    if (ran || g_adopted) g_caveLive = C;   // the exits jump into it from now on (an adopted one already did)
+    if (!ran)
+    {
+        if (!g_adopted) VirtualFree(cave, 0, MEM_RELEASE);   // never published
+        g_nSites = 0; g_cave = nullptr;
+        logf(log,ctx,true,"chatserial: no moment without a thread in the chat append or draw came within a second - NOT installed (chat still works, the serialization is off)");
+        return false;
+    }
     if (!ok)
     {
-        // Same rule as ChatSerial_Remove: only ENTRY sites (3,4) go back.
-        for (int i = 3; i < g_nSites; ++i) write_bytes(g_sites[i].addr, g_sites[i].saved, 5);
-        g_nSites = 0;
-        g_cave = nullptr;
-        logf(log,ctx,true,"chatserial: a patch write failed - entries reverted, NOT installed (redirected exits are retained, which is safe)");
+        if (stranded == 0) { g_nSites = 0; g_cave = nullptr; }   // exits retained (safe), entries verified back
+        logf(log,ctx,true, stranded == 0
+             ? "chatserial: a patch write failed - entries reverted, NOT installed (redirected exits are retained, which is safe)"
+             : "chatserial: a patch write failed, and an entry did NOT revert - it stays recorded for unload to retry; NOT active");
         return false;
     }
     g_base = base; g_writerRva = (uint32_t)(went - base); g_readerRva = (uint32_t)(rent - base);
@@ -296,33 +349,46 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
     return true;
 }
 
-void ChatSerial_Remove(void)
+size_t ChatSerial_Ranges(CodeRange* out, size_t max)
 {
-    // Only the two ENTRY sites go back to stock. The three EXIT sites stay redirected into the cave,
-    // and the cave is never freed.
-    if (g_nSites == 5)
-    {
-        write_bytes(g_sites[3].addr, g_sites[3].saved, 5);
-        write_bytes(g_sites[4].addr, g_sites[4].saved, 5);
-    }
-    else
-    {
-        for (int i = 0; i < g_nSites; ++i) write_bytes(g_sites[i].addr, g_sites[i].saved, 5);
-    }
-    g_nSites = 0;
-    g_cave = nullptr;
-    g_active = false;
-    g_base = 0; g_writerRva = 0; g_readerRva = 0;
+    size_t n = 0;
+    // The live cave stays reachable through the retained exits even after a failed install or a removal.
+    if (g_caveLive && n < max) out[n++] = CodeRange{ g_caveLive, g_caveLive + 0x1000 };
+    if (g_went && n < max) out[n++] = CodeRange{ g_went, g_went + k_writerSpan };
+    if (g_rent && n < max) out[n++] = CodeRange{ g_rent, g_rent + k_readerSpan };
+    return n;
+}
+
+int ChatSerial_SitesLeft(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_nSites; ++i) if (g_sites[i].entry && !g_sites[i].done) ++n;
+    return n;
+}
+
+bool ChatSerial_ReaderEntry(uintptr_t& rent)
+{
+    if (g_rent == 0) return false;
+    rent = g_rent;
+    return true;
 }
 
 void ChatSerial_Diag(ChatSerialLog log, void* ctx)
 {
     if (!log) return;
-    if (!g_active) { logf(log,ctx,false,"chatserial: INACTIVE (serialization not installed)"); return; }
+    if (!g_active && g_nSites == 0) { logf(log,ctx,false,"chatserial: INACTIVE (serialization not installed)"); return; }
+    if (!g_active)
+    {
+        logf(log,ctx,true,"chatserial: INACTIVE, but %d entry site(s) still hold a jmp (a failed install); they stay until the game closes", ChatSerial_SitesLeft());
+        for (int i = 0; i < g_nSites; ++i)
+            if (!g_sites[i].done) logf(log,ctx,false,"  stranded site %d: address 0x%08X (%s)", i, (uint32_t)g_sites[i].addr, g_sites[i].entry ? "entry" : "exit");
+        return;
+    }
     logf(log,ctx,false,"chatserial: ACTIVE - writer RVA 0x%06X, reader RVA 0x%06X, %d sites patched%s",
          g_writerRva, g_readerRva, g_nSites, g_adopted ? " (cave adopted from a previous load)" : "");
     for (int i = 0; i < g_nSites; ++i)
-        logf(log,ctx,false,"  chatserial site %d: RVA 0x%06X", i, (uint32_t)(g_sites[i].addr - g_base));
+        logf(log,ctx,false,"  chatserial site %d: RVA 0x%06X (%s%s)", i, (uint32_t)(g_sites[i].addr - g_base), g_sites[i].entry ? "entry" : "exit", g_sites[i].done ? ", restored" : "");
 }
 
 bool ChatSerial_Active(void) { return g_active; }
+bool ChatSerial_Pinned(void) { return g_pinned; }

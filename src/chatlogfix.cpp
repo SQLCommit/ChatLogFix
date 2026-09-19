@@ -66,14 +66,16 @@ namespace
     // measure the window without a Direct3D callback or needing fulllog open.
     const uint8_t a_vprect[]  = { 0x05,0x00,0x00,0x00,0x00,0x2B,0xC2,0x89,0x74,0x24,0x14,
                                   0x89,0x44,0x24,0x10 };
-    // logwindo's box pointer. Needed to reach the LIVE ring (ring = *(box+0x18)) so the indices can
-    // be reset before the modulus is narrowed -- see FillConst's restore path.
-    const uint8_t a_gslot[]   = { 0xA1,0x00,0x00,0x00,0x00,0x53,0x55,0x56,0x8B,0xF1,0x33,0xDB,
-                                  0x0F,0xBF,0x48,0x32,0x89,0x4C,0x24,0x10,0x57,0x8D,0x4C,0x24,
-                                  0x28,0x89,0x74,0x24,0x1C,0x89,0x5C,0x24,0x10 };
+
+    // The chat page routine at 0x1622E0 (Sep-10): nothing is written in it, but it and the two routines
+    // after it (0x162560, 0x1626E0) call the ring helpers and keep a ring index in a register across
+    // the call, so a thread inside them must not see the ring reset or narrowed under it. The writer
+    // calls the third one, so an addon thread can be there.
+    const uint8_t a_chatpage[] = { 0x83,0xEC,0x0C,0xA1,0x00,0x00,0x00,0x00,0x89,0x4C,0x24,0x00,0x53,0x55,
+                                   0x8A,0x48,0x08,0x56,0x84,0xC9 };
 
     enum { RA_CLEAR=0, RA_WRAP, RA_MAXIDX, RA_CAPINIT, RA_WALK, RA_WALK2,
-           RA_CAPGET, RA_STEPFWD, RA_FLA, RA_FLB, RA_VPRECT, RA_GSLOT, RA_COUNT };
+           RA_CAPGET, RA_STEPFWD, RA_FLA, RA_FLB, RA_VPRECT, RA_CHATPAGE, RA_COUNT };
 
     const RingAnchor k_anchors[RA_COUNT] = {
         { "ring_clear",   a_clear,   "xxxxxxxxxx",                    sizeof(a_clear)   },
@@ -87,7 +89,7 @@ namespace
         { "fulllog_stepA",a_flstepa, "xxxxxx????xxx",                 sizeof(a_flstepa) },
         { "fulllog_stepB",a_flstepb, "xxxxxxxxxxx",                   sizeof(a_flstepb) },
         { "viewport_rect",a_vprect,  "x????xxxxxxxxxx",               sizeof(a_vprect)  },
-        { "logwindo_slot",a_gslot,   "x????xxxxxxxxxxxxxxxxxxxxxxxxxxxx", sizeof(a_gslot) },
+        { "chat_page",    a_chatpage,"xxxx????xxxxxxxxxxxx",           sizeof(a_chatpage) },
     };
 
     // kind: 0 = imm8 n | 1 = imm8 -n | 2 = dword n-1 | 3 = dword n*0x200 | 4 = word n-1 | 5 = word n
@@ -174,6 +176,35 @@ namespace
 
     const int k_ringMax = 200;
 
+    // Function extents of every routine holding a site chatlogfix writes, as
+    // [anchor, anchor + len): each anchor sits at its function's entry. While a byte in one of these
+    // changes, no other thread may be anywhere inside it: it may hold a ring index in a register, sit
+    // part-way through a relocated block, or be about to read a bound (freeze.hpp).
+    const uint32_t k_anchorFnLen[RA_COUNT] = {
+        0x23,  // ring_clear     0x127250..0x127272
+        0x9A,  // ring_wrap      0x127280..0x127319
+        0x9B,  // ring_maxidx    0x127320..0x1273BA
+        0x1F7, // cap_init       0x1281F0..0x1283E6
+        0x50,  // ring_walk      0x1292E0..0x12932F
+        0x51,  // ring_walk2     0x129330..0x129380
+        0x6B,  // cap_get        0x1293F0..0x12945A
+        0x27,  // step_fwd       0x129C20..0x129C46
+        0x94,  // fulllog_stepA  0x1380E0..0x138173
+        0x7D,  // fulllog_stepB  0x138180..0x1381FC (its final ret is inside the relocated block)
+        0,     // viewport_rect  (a data read, never written)
+        0x9DB, // chat_page      0x1622E0..0x162CBA (three routines that call the ring helpers)
+    };
+    // The view-reset routine holding the two base-fix bytes: branch A's byte is 0x333 into it, and it
+    // is 0x3A8 long (0x1295D0..0x129977).
+    const uint32_t k_rebuildFnBefore = 0x333, k_rebuildFnLen = 0x3A8;
+    // Two clusters on top of the per-routine spans, so that every direct caller of a ring helper is
+    // covered whether or not it is a Ghidra-defined function: from the routine before ring_clear
+    // (0x1271C0, the first caller) through the view-reset routine's end (0x129978), which also holds
+    // the writer and the two helpers 0x129090/0x129290; and around the reader (0x137840..0x138600),
+    // which holds the fulllog steps and their other callers. Wider ranges only cost retries.
+    const uint32_t k_clusterABefore = 0x90, k_clusterALen = 0x27B8;    // ring_clear - 0x90 .. + len
+    const uint32_t k_clusterBBefore = 0x430, k_clusterBLen = 0xDC0;    // reader - 0x430 .. + len
+
     uint8_t* alloc_near(uintptr_t anchor, size_t len)
     {
         SYSTEM_INFO si;
@@ -224,6 +255,34 @@ namespace
 
     const char HL_ON  = '\x11';
     const char HL_OFF = '\x12';
+
+    plog::FileLog g_clfLog;   // logs\chatlogfix\<Name>_<id>\chatlogfix.log.
+
+    // The build stamp in the header of the file this image was loaded from, now; 0 when it cannot be read.
+    uint32_t file_stamp_of_self(void)
+    {
+        HMODULE self = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(&file_stamp_of_self), &self) || self == nullptr)
+            return 0;
+        char path[MAX_PATH];
+        const DWORD len = GetModuleFileNameA(self, path, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) return 0;
+        HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return 0;
+        uint8_t head[1024];
+        DWORD got = 0;
+        const BOOL read = ReadFile(f, head, sizeof(head), &got, nullptr);
+        CloseHandle(f);
+        if (!read || got < 0x40) return 0;
+        uint32_t pe = 0;
+        memcpy(&pe, head + 0x3C, 4);
+        if (pe > got - 12 || memcmp(head + pe, "PE\0\0", 4) != 0) return 0;
+        uint32_t stamp = 0;
+        memcpy(&stamp, head + pe + 8, 4);
+        return stamp;
+    }
 
     // mask: nullptr = exact match
     bool scan_span(const uint8_t* lo, uint32_t span, const uint8_t* pat, size_t len, ScanInfo* r,
@@ -352,14 +411,37 @@ namespace
     }
 }
 
+// The image's record of what it has written (chatlogfix.hpp): set once when the DLL maps, never by a load.
+uintptr_t chatlogfix::m_Site[2]          = { 0, 0 };
+uint8_t   chatlogfix::m_Orig[2]          = { k_stock, k_stock };
+bool      chatlogfix::m_Patched          = false;
+bool      chatlogfix::m_Dirty[2]         = { false, false };
+uintptr_t chatlogfix::m_Base             = 0;
+uint32_t  chatlogfix::m_ImgSize          = 0;
+uint32_t  chatlogfix::m_ImgStamp         = 0;
+ScanInfo  chatlogfix::m_Scan[2]          = {};
+bool      chatlogfix::m_RestoreOk        = true;
+bool      chatlogfix::m_ConstOn          = false;
+uintptr_t chatlogfix::m_RingAddr[64]     = {};
+int       chatlogfix::m_RingOrig[64]     = {};
+bool      chatlogfix::m_RelocOn          = false;
+int       chatlogfix::m_RelocN           = 0;
+uint8_t*  chatlogfix::m_Cave             = nullptr;
+uintptr_t chatlogfix::m_BlkAddr[6]       = {};
+uint8_t   chatlogfix::m_BlkOrig[6][32]   = {};
+uint8_t   chatlogfix::m_BlkPatch[6][32]  = {};
+uintptr_t chatlogfix::m_BlkSite[6]       = {};
+uint8_t   chatlogfix::m_BaseNow[2]       = { k_stock, k_stock };
+int       chatlogfix::m_FillN            = 0;
+bool      chatlogfix::m_Pinned           = false;
+HANDLE    chatlogfix::m_Sole             = nullptr;
+uintptr_t chatlogfix::m_AnchorAddr[16]   = {};
+bool      chatlogfix::m_AnchorTried[16]  = {};
+uintptr_t chatlogfix::m_VpAnchor         = 0;
+
 chatlogfix::chatlogfix(void)
-    : m_Core(nullptr), m_Log(nullptr), m_Id(0), m_Patched(false), m_ToldHowToReport(false)
-    , m_Base(0), m_ImgSize(0), m_ImgStamp(0), m_RestoreOk(true)
+    : m_Core(nullptr), m_Log(nullptr), m_Id(0), m_ToldHowToReport(false)
 {
-    m_Site[0]  = m_Site[1]  = 0;
-    m_Orig[0]  = m_Orig[1]  = k_stock;
-    m_Dirty[0] = m_Dirty[1] = false;
-    memset(m_Scan, 0, sizeof(m_Scan));
     m_Fail[0] = '\0';
 }
 
@@ -373,14 +455,22 @@ void chatlogfix::Print(uint8_t bodyColor, const char* fmt, ...)
     va_start(ap, fmt);
     _vsnprintf_s(raw, sizeof(raw), _TRUNCATE, fmt, ap);
     va_end(ap);
+    if (bodyColor == k_colFail && !m_Diag)
+    {
+        char named[512];
+        _snprintf_s(named, sizeof(named), _TRUNCATE, "%s Details: " HL("%s") "%s", raw, LogShown().c_str(), LogNote());
+        strcpy_s(raw, sizeof(raw), named);
+    }
 
-    if (m_DiagFp != nullptr)
+    if (m_Diag)
     {
         char plain[512]; size_t w = 0;
         for (size_t r = 0; raw[r] != '\0' && w + 1 < sizeof(plain); ++r)
             if (raw[r] != '\x11' && raw[r] != '\x12') plain[w++] = raw[r];
         plain[w] = '\0';
-        fprintf(m_DiagFp, "      %s\n", plain);
+        m_DiagText += "      ";
+        m_DiagText += plain;
+        m_DiagText += '\n';
         return;
     }
 
@@ -407,11 +497,7 @@ void chatlogfix::Print(uint8_t bodyColor, const char* fmt, ...)
     Log(bodyColor == k_colFail || bodyColor == k_colWarn, "%s", plain);
 
     IChatManager* cm = (m_Core != nullptr) ? m_Core->GetChatManager() : nullptr;
-    if (cm == nullptr)
-    {
-        if (m_Log == nullptr) OutputDebugStringA(plain);
-        return;
-    }
+    if (cm == nullptr) return;   // already in chatlogfix's own log
 
     char out[576];
     _snprintf_s(out, sizeof(out), _TRUNCATE,
@@ -420,9 +506,90 @@ void chatlogfix::Print(uint8_t bodyColor, const char* fmt, ...)
     cm->AddChatMessage(1, false, out);
 }
 
+// Chat only: the usage line, and the unload line (the log has it in its own words, with the run tag).
+void chatlogfix::Chat(uint8_t bodyColor, const char* text)
+{
+    IChatManager* cm = (m_Core != nullptr) ? m_Core->GetChatManager() : nullptr;
+    if (cm == nullptr || text == nullptr) return;
+    char body[512];
+    size_t w = 0;
+    for (size_t r = 0; text[r] != '\0' && w + 3 < sizeof(body); ++r)
+    {
+        if (text[r] == HL_ON)       { body[w++] = '\x1E'; body[w++] = static_cast<char>(k_colCmd); }
+        else if (text[r] == HL_OFF) { body[w++] = '\x1E'; body[w++] = static_cast<char>(bodyColor); }
+        else                        { body[w++] = text[r]; }
+    }
+    body[w] = '\0';
+    char out[576];
+    _snprintf_s(out, sizeof(out), _TRUNCATE,
+        "\x1E\x51" "[" "\x1E\x06" "chatlogfix" "\x1E\x51" "]" "\x1E\x01" " " "\x1E%c" "%s" "\x1E\x01", bodyColor, body);
+    cm->AddChatMessage(1, false, out);
+}
+
+std::string chatlogfix::LogShown(void) { return plog::underRoot(m_Root, g_clfLog.path()); }
+// A refused load never moves its startup file, so it gets no "moves" note.
+const char* chatlogfix::LogNote(void) { return (!m_Refused && g_clfLog.atStartupFile()) ? " (it moves into your character's log at login)" : ""; }
+
+void chatlogfix::DiagBegin(void)
+{
+    m_Diag = true;
+    m_DiagText.clear();
+}
+
+// The report goes into the log as one block; chat says where.
+void chatlogfix::DiagEnd(void)
+{
+    m_Diag = false;
+    char who[96];
+    _snprintf_s(who, sizeof(who), _TRUNCATE, "chatlogfix %.1f build %08X", GetVersion(), plog::ownImageStamp(&g_clfLog));
+    g_clfLog.writeDiag(who, m_DiagText);
+    m_DiagText.clear();
+    Print(k_colInfo, "Diagnostics written to " HL("%s") "%s.", LogShown().c_str(), LogNote());
+}
+
+// The character this client is playing (login status 2, party slot 0): a new one moves the log.
+void chatlogfix::FollowCharacter(void)
+{
+    if (m_Core == nullptr) return;
+    IMemoryManager* mm = m_Core->GetMemoryManager();
+    IPlayer* player = mm != nullptr ? mm->GetPlayer() : nullptr;
+    IParty* party = mm != nullptr ? mm->GetParty() : nullptr;
+    if (player == nullptr || party == nullptr || player->GetLoginStatus() != 2) return;
+    const char* name = party->GetMemberName(0);
+    const uint32_t serverId = party->GetMemberServerId(0);
+    if (name == nullptr || name[0] == '\0' || serverId == 0) return;
+    const std::string key = plog::characterKey(name, serverId);
+    if (key == m_CharKey) return;
+    m_CharKey = key;
+    g_clfLog.moveToCharacter(plog::characterLogPath(m_Root, "chatlogfix", key), name);
+}
+
+// Once a second: the character, and the log's own warnings. Nothing else runs per frame.
+void chatlogfix::Direct3DPresent(const RECT*, const RECT*, HWND, const RGNDATA*)
+{
+    if (m_FrameDead || m_Refused) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < m_NextCharCheck) return;
+    m_NextCharCheck = now + 1000;
+    try
+    {
+        FollowCharacter();
+        if (g_clfLog.takeWriteWarning())
+            Print(k_colWarn, "can't write its log (%s).", LogShown().c_str());
+        if (g_clfLog.takeTrimWarning())
+            Print(k_colWarn, "its log is over 1.5 MB and cannot be trimmed (%s): is another program holding it open?", LogShown().c_str());
+    }
+    catch (...)
+    {
+        m_FrameDead = true;
+        Log(true, "error: Direct3DPresent: an unexpected error; the once-a-second character check stops for this session");
+        Print(k_colFail, "an unexpected error stopped its once-a-second check.");
+    }
+}
+
 void chatlogfix::Usage(void)
 {
-    Print(k_colInfo, HL("/chatlogfix") " [" HL("status") "|" HL("diag") "]   (or " HL("/clf") ")");
+    Chat(k_colInfo, HL("/chatlogfix") " [" HL("status") "|" HL("diag") "]   (or " HL("/clf") ")");
 }
 
 void chatlogfix::Fail(const char* fmt, ...)
@@ -458,41 +625,14 @@ void chatlogfix::Log(bool warn, const char* fmt, ...)
     va_start(ap, fmt);
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
-    if (m_DiagFp != nullptr)
+    if (m_Diag)
     {
-        fprintf(m_DiagFp, "%s%s\n", warn ? "WARN  " : "      ", buf);
+        m_DiagText += warn ? "WARN  " : "      ";
+        m_DiagText += buf;
+        m_DiagText += '\n';
         return;
     }
-    if (m_Log == nullptr) return;
-    m_Log->Log(static_cast<uint32_t>(warn ? Ashita::LogLevel::Warn : Ashita::LogLevel::Info),
-               "chatlogfix", buf);
-}
-
-bool chatlogfix::DiagOpen(char* pathOut, size_t n)
-{
-    if (m_Core == nullptr) return false;
-    const char* inst = m_Core->GetInstallPath();
-    if (inst == nullptr || inst[0] == '\0') return false;
-
-    const size_t len = strlen(inst);
-    const char* sep  = (len > 0 && (inst[len - 1] == '\\' || inst[len - 1] == '/')) ? "" : "\\";
-    _snprintf_s(pathOut, n, _TRUNCATE, "%s%slogs\\chatlogfix_diag.log", inst, sep);
-
-    if (fopen_s(&m_DiagFp, pathOut, "a") != 0 || m_DiagFp == nullptr) { m_DiagFp = nullptr; return false; }
-
-    char stamp[64] = "unknown time";
-    __time64_t t = _time64(nullptr);
-    struct tm lt;
-    if (_localtime64_s(&lt, &t) == 0) strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &lt);
-    fprintf(m_DiagFp, "\n===== chatlogfix diag  %s =====\n", stamp);
-    return true;
-}
-
-void chatlogfix::DiagClose(void)
-{
-    if (m_DiagFp == nullptr) return;
-    fclose(m_DiagFp);
-    m_DiagFp = nullptr;
+    g_clfLog.write(warn ? "warn" : "info", buf);
 }
 
 void chatlogfix::NoteWrite(int i, const WriteInfo& w)
@@ -599,7 +739,6 @@ bool chatlogfix::Resolve(void)
     m_ImgStamp = m.timeStamp;
     Log(false, "resolve   FFXiMain.dll base 0x%08X, build 0x%08X, %u executable section(s)",
         static_cast<unsigned>(m.base), m.timeStamp, m.nexec);
-    LogSections(m);
 
     for (int i = 0; i < 2; ++i) scan_all(m, k_sigs[i].pat, k_sigs[i].len, m_Scan[i]);
 
@@ -611,8 +750,8 @@ bool chatlogfix::Resolve(void)
             if (m_Scan[i].code == SCAN_FAULTED)
             {
                 Fail("Reading FFXiMain's code faulted partway through the scan of %s, so the search "
-                     "never completed. This is not a missing signature - see the Ashita log for how "
-                     "far it got before it stopped.", k_sigs[i].name);
+                     "never completed. This is not a missing signature - its log says how far "
+                     "it got before it stopped.", k_sigs[i].name);
             }
             else if (m_Scan[i].code == SCAN_NOT_FOUND)
                 Fail("%s: signature NOT FOUND (scanned %u executable section(s), %u KB) on FFXiMain "
@@ -636,66 +775,45 @@ bool chatlogfix::Resolve(void)
 }
 
 // ================================================================================================
-// FILL MODE - engages only on a chat window holding more than 99 rows; constants up to 127 rows,
-// relocation beyond that
+// FREEZE - the DLL pins itself before its first write, and every code write happens with every other
+// thread stopped and none of them inside the chat code, either cave, or this DLL (freeze.hpp)
 // ================================================================================================
 
-uintptr_t chatlogfix::Anchor(int idx)
+bool chatlogfix::Pin(void)
 {
-    ModuleInfo m;
-    if (probe_module(m) != MOD_OK) return 0;
-    ScanInfo r;
-    scan_all(m, k_anchors[idx].pat, k_anchors[idx].len, r, k_anchors[idx].mask);
-    return (r.hits == 1) ? r.hitAt[0] : 0;
+    if (m_Pinned) return true;
+    m_Pinned = PinThisModule();
+    if (!m_Pinned)
+        FailLoud("chatlogfix could not keep itself loaded (Windows error %u), so it changes nothing in the game.",
+                 static_cast<unsigned>(GetLastError()));
+    return m_Pinned;
 }
 
-int chatlogfix::WindowRows(void)
+uintptr_t chatlogfix::AnchorCached(int idx)
 {
-    if (m_VpAnchor == 0) m_VpAnchor = Anchor(RA_VPRECT);
-    const uintptr_t a = m_VpAnchor;
-    if (a == 0) return -1;
-    uint32_t pHeight = 0;
-    if (!safe_read(a + 1, &pHeight, 4) || pHeight < 0x10000) return -1;
-    uint16_t hw = 0;
-    if (!safe_read(pHeight, &hw, 2)) return -1;
-    const int h = static_cast<int>(hw);
-    if (h < 240 || h > 16384) return -1;
-    return (h / 16) - 5;
+    if (idx < 0 || idx >= RA_COUNT) return 0;
+    if (!m_AnchorTried[idx]) { m_AnchorTried[idx] = true; m_AnchorAddr[idx] = Anchor(idx); }
+    return m_AnchorAddr[idx];
 }
 
-bool chatlogfix::RingResetState(void)
+size_t chatlogfix::CollectRanges(CodeRange* out, size_t max)
 {
-    // The 33 constants and the six relocated blocks are CODE shared by every chat window, but
-    // logwindo and logwin2 each own a ring that fills independently (re/chat-windows.md: adjacent
-    // gslots, one routine drives both).
-    const uintptr_t a = Anchor(RA_GSLOT);
-    if (a == 0) return false;
-    uint32_t slot = 0;
-    if (!safe_read(a + 1, &slot, 4) || slot < 0x10000) return false;
-    // Reset one window's ring indices (newest/oldest/count) and read them back. A window whose box
-    // does not exist yet (0) is fine; a ring we can see but cannot zero is not.
-    auto reset_one = [this](uintptr_t s) -> bool
+    size_t n = 0;
+    auto add = [&](uintptr_t lo, uintptr_t len) { if (lo != 0 && len != 0 && n < max) out[n++] = CodeRange{ lo, lo + len }; };
+    uintptr_t lo = 0, hi = 0;
+    if (ModuleRangeOf(reinterpret_cast<const void*>(&PinThisModule), lo, hi)) add(lo, hi - lo);
+    else add(0x10000, 0x7FFF0000);   // this DLL's span is unknown: treat every thread as busy
+    for (int i = 0; i < RA_COUNT; ++i)
+        if (k_anchorFnLen[i] != 0) add(AnchorCached(i), k_anchorFnLen[i]);
+    if (Ready()) add(m_Site[0] - k_rebuildFnBefore, k_rebuildFnLen);
+    if (AnchorCached(RA_CLEAR) != 0) add(AnchorCached(RA_CLEAR) - k_clusterABefore, k_clusterALen);
     {
-        uint32_t box = 0, ring = 0;
-        if (!safe_read(s, &box, 4)) return false;
-        if (box < 0x10000) return true;
-        if (!safe_read(box + 0x18, &ring, 4)) return false;
-        if (ring < 0x10000) return true;
-        const uint16_t z = 0;
-        static const uint32_t offs[3] = { 0x14, 0x16, 0x1a };   // newest, oldest, count
-        for (int i = 0; i < 3; ++i)
-        {
-            if (!WriteAt(ring + offs[i], &z, 2)) return false;
-            uint16_t chk = 0xFFFF;
-            if (!safe_read(ring + offs[i], &chk, 2) || chk != 0) return false;
-        }
-        return true;
-    };
-    const bool one = reset_one(slot);       // logwindo
-    const bool two = reset_one(slot + 4);   // logwin2 (adjacent gslot)
-    if (!one) Log(true, "ring reset: chat window 1 could not be zeroed");
-    if (!two) Log(true, "ring reset: chat window 2 could not be zeroed");
-    return one && two;
+        uintptr_t rent = 0;
+        if (ChatSerial_ReaderEntry(rent)) add(rent - k_clusterBBefore, k_clusterBLen);
+    }
+    if (m_Cave != nullptr) add(reinterpret_cast<uintptr_t>(m_Cave), 0x1000);
+    n += ChatSerial_Ranges(out + n, max - n);
+    return n;
 }
 
 bool chatlogfix::WriteAt(uintptr_t addr, const void* src, size_t len)
@@ -726,46 +844,125 @@ static int ring_want(uint8_t kind, int n)
     if (kind == 1) return -n;
     return n;
 }
-
-bool chatlogfix::FillConst(bool on)
+static bool ring_write_at(chatlogfix* self, bool (chatlogfix::*w)(uintptr_t, const void*, size_t), uintptr_t a, uint8_t kind, int v)
 {
-    if (!on)
-    {
-        if (!m_ConstOn) { Log(false, "fill mode already off"); return true; }
-        if (!RingResetState())
-        {
-            FailLoud("Cannot reach the chat ring to reset it, so fill mode is being " HL("LEFT ON") ". "
-                 "Narrowing the size while the indices are out of range would hang the client. "
-                 "Zone or relog, then unload chatlogfix again.");
-            return false;
-        }
-        int bad = 0;
-        for (size_t i = 0; i < k_ringN; ++i)
-        {
-            if (m_RingAddr[i] == 0) continue;
-            const uint8_t k = k_ringSites[i].kind;
-            if (k == 2 || k == 3) { uint32_t v = static_cast<uint32_t>(m_RingOrig[i]); WriteAt(m_RingAddr[i], &v, 4); }
-            else if (k == 4 || k == 5) { uint16_t v = static_cast<uint16_t>(m_RingOrig[i]); WriteAt(m_RingAddr[i], &v, 2); }
-            else { int8_t v = static_cast<int8_t>(m_RingOrig[i]); WriteAt(m_RingAddr[i], &v, 1); }
-            if (ring_read_at(m_RingAddr[i], k) != m_RingOrig[i]) ++bad;
-        }
-        if (m_Patched && Ready())
-        {
-            const uint8_t v = k_target;
-            for (int b = 0; b < 2; ++b)
-            {
-                WriteAt(m_Site[b], &v, 1);
-                if (*reinterpret_cast<const uint8_t*>(m_Site[b]) != v) ++bad;
-            }
-        }
-        m_ConstOn = false;
-        if (bad == 0) Print(k_colInfo, "Fill mode " HL("OFF") " - ring back to %d records, fill back to %d.",
-                            k_ringStock, k_target);
-        else          FailLoud("Fill mode restore INCOMPLETE - %d site(s) did not take. "
-                           "Run " HL("/clf diag") " and report it.", bad);
-        return bad == 0;
-    }
+    if (kind == 2 || kind == 3) { uint32_t x = static_cast<uint32_t>(v); return (self->*w)(a, &x, 4); }
+    if (kind == 4 || kind == 5) { uint16_t x = static_cast<uint16_t>(v); return (self->*w)(a, &x, 2); }
+    if (kind == 1)              { int8_t   x = static_cast<int8_t>(v);   return (self->*w)(a, &x, 1); }
+    uint8_t x = static_cast<uint8_t>(v); return (self->*w)(a, &x, 1);
+}
 
+// The constants back to stock. A site already stock is forgotten; one holding neither our value nor
+// stock belongs to someone else now and is left alone (counted). Writes only.
+int chatlogfix::RestoreConstsIn(void)
+{
+    int bad = 0;
+    for (size_t i = 0; i < k_ringN; ++i)
+    {
+        if (m_RingAddr[i] == 0) continue;
+        const uint8_t k = k_ringSites[i].kind;
+        const int now = ring_read_at(m_RingAddr[i], k);
+        if (now == m_RingOrig[i]) { m_RingAddr[i] = 0; continue; }
+        if (now != ring_want(k, m_FillN)) { ++bad; continue; }
+        ring_write_at(this, &chatlogfix::WriteAt, m_RingAddr[i], k, m_RingOrig[i]);
+        if (ring_read_at(m_RingAddr[i], k) == m_RingOrig[i]) m_RingAddr[i] = 0;
+        else ++bad;
+    }
+    return bad;
+}
+
+// The six relocated blocks back to stock; a block that is neither our jump nor stock is someone
+// else's and is left alone. The cave is NEVER freed: a thread may still be inside it. Once no block
+// points at it any more (and this ran with no thread in it) it is simply forgotten. Writes only.
+int chatlogfix::RestoreBlocksIn(void)
+{
+    int left = 0;
+    for (int b = 0; b < BK_COUNT; ++b)
+    {
+        if (m_BlkAddr[b] == 0) continue;
+        const uint8_t len = k_blocks[b].len;
+        uint8_t cur[32];
+        if (!safe_read(m_BlkAddr[b], cur, len)) { ++left; continue; }
+        if (memcmp(cur, m_BlkOrig[b], len) == 0) { m_BlkAddr[b] = 0; continue; }
+        if (memcmp(cur, m_BlkPatch[b], len) != 0) { ++left; continue; }
+        if (WriteAt(m_BlkAddr[b], m_BlkOrig[b], len) && safe_read(m_BlkAddr[b], cur, len) && memcmp(cur, m_BlkOrig[b], len) == 0)
+            m_BlkAddr[b] = 0;
+        else
+            ++left;
+    }
+    if (left == 0) m_Cave = nullptr;
+    return left;
+}
+
+// The two base-fix bytes to `value`, only over the byte we last wrote there (another tool's byte is
+// left alone and counted). Never call while a relocated block is still redirected: the bytes sit
+// inside its jump. Writes only.
+int chatlogfix::WriteBaseIn(uint8_t value)
+{
+    if (!Ready()) return 0;
+    int bad = 0;
+    for (int b = 0; b < 2; ++b)
+    {
+        const uint8_t cur = *reinterpret_cast<volatile uint8_t*>(m_Site[b]);
+        if (cur == value) { m_BaseNow[b] = value; continue; }
+        if (cur != m_BaseNow[b]) { ++bad; continue; }
+        WriteInfo w;
+        if (write_byte(m_Site[b], value, &w)) m_BaseNow[b] = value;
+        else ++bad;
+    }
+    return bad;
+}
+
+// How many sites no longer hold what chatlogfix last wrote there: the base bytes (unless a relocated block's jump now
+// covers them), the constants, and the relocated blocks. A /load of this image takes its earlier load's changes back
+// over only when this is 0. Reads only.
+int chatlogfix::Overwritten(void)
+{
+    int n = 0;
+    const bool covered[2] = { m_BlkAddr[BK_FILLA] != 0, m_BlkAddr[BK_FILLB] != 0 };
+    for (int b = 0; b < 2; ++b)
+        if (m_Dirty[b] && !covered[b] && *reinterpret_cast<volatile uint8_t*>(m_Site[b]) != m_BaseNow[b]) ++n;
+    for (size_t i = 0; i < k_ringN; ++i)
+        if (m_RingAddr[i] != 0 && ring_read_at(m_RingAddr[i], k_ringSites[i].kind) != ring_want(k_ringSites[i].kind, m_FillN)) ++n;
+    for (int b = 0; b < BK_COUNT; ++b)
+    {
+        if (m_BlkAddr[b] == 0) continue;
+        uint8_t cur[32];
+        if (!safe_read(m_BlkAddr[b], cur, k_blocks[b].len) || memcmp(cur, m_BlkPatch[b], k_blocks[b].len) != 0) ++n;
+    }
+    return n;
+}
+
+// ================================================================================================
+// FILL MODE - engages only on a chat window holding more than 99 rows; constants up to 127 rows,
+// relocation beyond that
+// ================================================================================================
+
+uintptr_t chatlogfix::Anchor(int idx)
+{
+    ModuleInfo m;
+    if (probe_module(m) != MOD_OK) return 0;
+    ScanInfo r;
+    scan_all(m, k_anchors[idx].pat, k_anchors[idx].len, r, k_anchors[idx].mask);
+    return (r.hits == 1) ? r.hitAt[0] : 0;
+}
+
+int chatlogfix::WindowRows(void)
+{
+    if (m_VpAnchor == 0) m_VpAnchor = AnchorCached(RA_VPRECT);
+    const uintptr_t a = m_VpAnchor;
+    if (a == 0) return -1;
+    uint32_t pHeight = 0;
+    if (!safe_read(a + 1, &pHeight, 4) || pHeight < 0x10000) return -1;
+    uint16_t hw = 0;
+    if (!safe_read(pHeight, &hw, 2)) return -1;
+    const int h = static_cast<int>(hw);
+    if (h < 240 || h > 16384) return -1;
+    return (h / 16) - 5;
+}
+
+bool chatlogfix::FillConst(void)
+{
     if (m_ConstOn) { Log(false, "fill mode already on"); return true; }
     if (!Ready() || !m_Patched)
     { Fail("Fill mode needs the base fix applied first."); return false; }
@@ -782,56 +979,63 @@ bool chatlogfix::FillConst(bool on)
     }
 
     // ---- PASS 1: resolve and verify EVERYTHING before one byte is written -----------------------
-    uintptr_t anch[RA_COUNT] = { 0 };
     uintptr_t addr[64] = { 0 };
     int       orig[64] = { 0 };
     for (size_t i = 0; i < k_ringN; ++i)
     {
         const uint8_t ai = k_ringSites[i].anchor;
-        if (anch[ai] == 0)
-        {
-            anch[ai] = Anchor(ai);
-            if (anch[ai] == 0)
-            { Fail("Fill mode: %s did not resolve uniquely - refusing (nothing was patched).",
-                   k_anchors[ai].name); return false; }
-        }
-        addr[i] = anch[ai] + k_ringSites[i].off;
+        const uintptr_t an = AnchorCached(ai);
+        if (an == 0)
+        { Fail("Fill mode: %s did not resolve uniquely - refusing (nothing was patched).",
+               k_anchors[ai].name); return false; }
+        addr[i] = an + k_ringSites[i].off;
         orig[i] = ring_read_at(addr[i], k_ringSites[i].kind);
         if (orig[i] != k_ringSites[i].stock &&
             (k_ringSites[i].alt < 0 || orig[i] != k_ringSites[i].alt))
         { Fail("Fill mode: %s+0x%X holds %d, expected %d - refusing (nothing was patched).",
                k_anchors[ai].name, k_ringSites[i].off, orig[i], k_ringSites[i].stock); return false; }
     }
+    if (!Pin()) return false;
 
-    // ---- PASS 2: write, read back, roll the WHOLE set back on any failure -----------------------
-    for (size_t i = 0; i < k_ringN; ++i)
+    // ---- PASS 2: write, read back, roll the WHOLE set back on any failure; all with every other
+    //      thread stopped and out of the chat code ------------------------------------------------
+    m_FillN = k_constMax;
+    int failAt = -1, baseBad = 0, rollbackLeft = 0;
+    const bool ran = Frozen([&]
     {
-        m_RingAddr[i] = addr[i];
-        m_RingOrig[i] = orig[i];
-        const uint8_t k = k_ringSites[i].kind;
-        const int w = ring_want(k, k_constMax);
-        if (k == 3 || k == 2) { uint32_t v = static_cast<uint32_t>(w); WriteAt(addr[i], &v, 4); }
-        else if (k == 4 || k == 5) { uint16_t v = static_cast<uint16_t>(w); WriteAt(addr[i], &v, 2); }
-        else { int8_t v = static_cast<int8_t>(w); WriteAt(addr[i], &v, 1); }
-        if (ring_read_at(addr[i], k) != w)
+        for (size_t i = 0; i < k_ringN; ++i)
         {
-            for (size_t j = 0; j <= i; ++j)
-            {
-                const uint8_t kj = k_ringSites[j].kind;
-                if (kj == 2 || kj == 3) { uint32_t v = static_cast<uint32_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 4); }
-                else if (kj == 4 || kj == 5) { uint16_t v = static_cast<uint16_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 2); }
-                else { int8_t v = static_cast<int8_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 1); }
-            }
-            m_ConstOn = false;
-            Fail("Fill mode: write failed at %s+0x%X - rolled back, nothing is patched.",
-                 k_anchors[k_ringSites[i].anchor].name, k_ringSites[i].off);
-            return false;
+            m_RingAddr[i] = addr[i];
+            m_RingOrig[i] = orig[i];
+            const uint8_t k = k_ringSites[i].kind;
+            const int w = ring_want(k, k_constMax);
+            ring_write_at(this, &chatlogfix::WriteAt, addr[i], k, w);
+            if (ring_read_at(addr[i], k) != w) { failAt = static_cast<int>(i); m_RingAddr[i] = 0; break; }
         }
-    }
-    for (int b = 0; b < 2; ++b)
+        if (failAt < 0)
+        {
+            baseBad = WriteBaseIn(static_cast<uint8_t>(k_constMax - 1));
+            if (baseBad) WriteBaseIn(k_target);
+        }
+        if (failAt >= 0 || baseBad) rollbackLeft = RestoreConstsIn();
+    });
+    if (!ran)
     {
-        const uint8_t v = static_cast<uint8_t>(k_constMax - 1);
-        WriteAt(m_Site[b], &v, 1);
+        memset(m_RingAddr, 0, sizeof(m_RingAddr));
+        Fail("Fill mode: no moment without a game thread in the chat code came within a second - nothing was patched.");
+        return false;
+    }
+    if (failAt >= 0 || baseBad)
+    {
+        m_ConstOn = (rollbackLeft > 0);
+        if (rollbackLeft == 0)
+            Fail("Fill mode: write failed at %s - rolled back, nothing is patched.",
+                 failAt >= 0 ? k_anchors[k_ringSites[failAt].anchor].name : "the rebuild bound");
+        else
+            FailLoud("Fill mode: write failed at %s, and %d site(s) of the rollback did not take (left as they are). "
+                     "Run " HL("/clf diag") " and report it.",
+                     failAt >= 0 ? k_anchors[k_ringSites[failAt].anchor].name : "the rebuild bound", rollbackLeft);
+        return false;
     }
     m_ConstOn = true;
     Print(k_colInfo, "Filling %d lines for your %d-row window. Reopen the log to rebuild.",
@@ -853,21 +1057,11 @@ void chatlogfix::AutoApply(void)
     }
     if (rows <= k_ringStock - 1) return;
 
-    FillApply(true);
+    FillApply();
 }
 
-bool chatlogfix::FillApply(bool on)
+bool chatlogfix::FillApply(void)
 {
-    if (!on)
-    {
-        if (!m_ConstOn && !m_RelocOn)
-        { Log(false, "fill mode already off"); return true; }
-        bool ok = true;
-        if (m_RelocOn)  ok = FillReloc(false) && ok;
-        if (m_ConstOn) ok = FillConst(false)  && ok;
-        return ok;
-    }
-
     if (m_ConstOn || m_RelocOn)
     { Log(false, "fill mode already on"); return true; }
     if (!Ready() || !m_Patched)
@@ -881,19 +1075,21 @@ bool chatlogfix::FillApply(bool on)
         Log(false, "not needed: window holds %d rows, base fix fills %d", rows, k_ringStock - 1);
         return false;
     }
-    return (rows <= k_constMax - 1) ? FillConst(true) : FillReloc(true);
+    return (rows <= k_constMax - 1) ? FillConst() : FillReloc();
 }
 
-bool chatlogfix::CaveInstall(int n, int fill)
+// Resolves and verifies the six blocks, allocates and builds the cave, and prepares each site's jump
+// (m_BlkPatch). Writes NOTHING into the client: FillReloc does that inside its frozen pass.
+bool chatlogfix::CavePrepare(int n, int fill)
 {
     uintptr_t site[BK_COUNT] = { 0 };
     uintptr_t back[BK_COUNT] = { 0 };
     uintptr_t jgeT[BK_COUNT] = { 0 };
-    uintptr_t anch[RA_COUNT] = { 0 };
 
     for (int b = 0; b < BK_COUNT; ++b)
     {
         const RingBlock& k = k_blocks[b];
+        uintptr_t an = 0;
         if (k.anchor < 0)
         {
             const int which = (b == BK_FILLA) ? 0 : 1;
@@ -902,14 +1098,11 @@ bool chatlogfix::CaveInstall(int n, int fill)
         }
         else
         {
-            if (anch[k.anchor] == 0)
-            {
-                anch[k.anchor] = Anchor(k.anchor);
-                if (anch[k.anchor] == 0)
-                { Fail("Fill mode: %s did not resolve uniquely - refusing (nothing was patched).",
-                       k_anchors[k.anchor].name); return false; }
-            }
-            site[b] = anch[k.anchor] + k.off;
+            an = AnchorCached(k.anchor);
+            if (an == 0)
+            { Fail("Fill mode: %s did not resolve uniquely - refusing (nothing was patched).",
+                   k_anchors[k.anchor].name); return false; }
+            site[b] = an + k.off;
         }
 
         uint8_t cur[32];
@@ -922,7 +1115,7 @@ bool chatlogfix::CaveInstall(int n, int fill)
 
         memcpy(m_BlkOrig[b], cur, k.len);
         back[b] = (k.anchor < 0) ? site[b] + k.len
-                : (k.backOff != 0) ? anch[k.anchor] + k.backOff : 0;
+                : (k.backOff != 0) ? an + k.backOff : 0;
         if (b == BK_FILLA) jgeT[b] = site[b] + 9  + static_cast<int8_t>(cur[8]);
         if (b == BK_FILLB) jgeT[b] = site[b] + 13 + *reinterpret_cast<const int32_t*>(cur + 9);
     }
@@ -974,109 +1167,25 @@ bool chatlogfix::CaveInstall(int n, int fill)
             break;
         }
     }
+    FlushInstructionCache(GetCurrentProcess(), m_Cave, 0x1000);
 
     for (int b = 0; b < BK_COUNT; ++b)
     {
         const intptr_t d = static_cast<intptr_t>(entry[b]) - static_cast<intptr_t>(site[b] + 5);
         if (d > 0x7FFF0000 || d < -0x7FFF0000)
         { Fail("Fill mode: %s is out of jump range of the cave - refusing.", k_blocks[b].name);
-          VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr; return false; }
-    }
-
-    // ---- write the jumps; roll the whole set back if any one does not take -----------------------
-    for (int b = 0; b < BK_COUNT; ++b)
-    {
-        uint8_t jmp[32];
-        memset(jmp, 0x90, sizeof(jmp));
-        jmp[0] = 0xE9;
-        const int32_t rel = static_cast<int32_t>(static_cast<intptr_t>(entry[b]) -
-                                                 static_cast<intptr_t>(site[b] + 5));
-        memcpy(jmp + 1, &rel, 4);
-        WriteAt(site[b], jmp, k_blocks[b].len);
-        m_BlkAddr[b] = site[b];
-
-        uint8_t chk[32];
-        if (!safe_read(site[b], chk, k_blocks[b].len) || memcmp(chk, jmp, k_blocks[b].len) != 0)
-        {
-            const int left = CaveRemove();
-            if (left == 0)
-                Fail("Fill mode: could not redirect %s - rolled back, nothing is patched.", k_blocks[b].name);
-            else
-                FailLoud("Fill mode: could not redirect %s, and %d block(s) of the rollback did not take - "
-                         "the cave is kept so no jump points at freed memory. Run " HL("/clf diag") " and report it.",
-                         k_blocks[b].name, left);
-            return false;
-        }
+          VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr; return false; }   // never published
+        memset(m_BlkPatch[b], 0x90, sizeof(m_BlkPatch[b]));
+        m_BlkPatch[b][0] = 0xE9;
+        const int32_t rel = static_cast<int32_t>(static_cast<intptr_t>(entry[b]) - static_cast<intptr_t>(site[b] + 5));
+        memcpy(m_BlkPatch[b] + 1, &rel, 4);
+        m_BlkSite[b] = site[b];
     }
     return true;
 }
 
-// Restore every relocated block and read each back. Returns how many are STILL redirected; the cave
-// is freed only when that is zero.
-int chatlogfix::CaveRemove(void)
+bool chatlogfix::FillReloc(void)
 {
-    int left = 0;
-    for (int b = 0; b < BK_COUNT; ++b)
-    {
-        if (m_BlkAddr[b] == 0) continue;
-        uint8_t chk[32];
-        if (WriteAt(m_BlkAddr[b], m_BlkOrig[b], k_blocks[b].len)
-            && safe_read(m_BlkAddr[b], chk, k_blocks[b].len)
-            && memcmp(chk, m_BlkOrig[b], k_blocks[b].len) == 0)
-            m_BlkAddr[b] = 0;
-        else
-            ++left;
-    }
-    if (left == 0 && m_Cave != nullptr) { VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr; }
-    return left;
-}
-
-bool chatlogfix::FillReloc(bool on)
-{
-    if (!on)
-    {
-        if (!m_RelocOn) { Log(false, "fill mode already off"); return true; }
-        if (!RingResetState())
-        {
-            FailLoud("Cannot reach the chat ring to reset it, so fill mode is being " HL("LEFT ON") ". "
-                 "Narrowing the size while the indices are out of range would hang the client. "
-                 "Zone or relog, then unload chatlogfix again.");
-            return false;
-        }
-        int bad = 0;
-        for (size_t i = 0; i < k_ringN; ++i)
-        {
-            if (m_RingAddr[i] == 0) continue;
-            const uint8_t k = k_ringSites[i].kind;
-            if (k == 2 || k == 3) { uint32_t v = static_cast<uint32_t>(m_RingOrig[i]); WriteAt(m_RingAddr[i], &v, 4); }
-            else if (k == 4 || k == 5) { uint16_t v = static_cast<uint16_t>(m_RingOrig[i]); WriteAt(m_RingAddr[i], &v, 2); }
-            else { uint8_t v = static_cast<uint8_t>(m_RingOrig[i]); WriteAt(m_RingAddr[i], &v, 1); }
-            if (ring_read_at(m_RingAddr[i], k) != m_RingOrig[i]) ++bad;
-            m_RingAddr[i] = 0;
-        }
-        const int left = CaveRemove();
-        bad += left;
-        // The two base-fix bytes sit INSIDE code a relocated block replaced; writing them while a
-        // block is still a jmp would corrupt that jmp's displacement. Only when every block is back.
-        if (left == 0 && m_Patched && Ready())
-        {
-            const uint8_t v = k_target;
-            for (int b = 0; b < 2; ++b)
-            {
-                WriteAt(m_Site[b], &v, 1);
-                if (*reinterpret_cast<const uint8_t*>(m_Site[b]) != v) ++bad;
-            }
-        }
-        m_RelocOn = (left > 0);   // stays on while a block is still redirected; the cave is retained for it
-        if (left == 0) m_RelocN = 0;
-        if (bad == 0) Print(k_colInfo, "Fill mode " HL("OFF") " - ring back to %d records, fill back to %d.",
-                            k_ringStock, k_target);
-        else          FailLoud("Fill mode restore INCOMPLETE - %d site(s) did not take%s. "
-                           "Run " HL("/clf diag") " and report it.", bad,
-                           left > 0 ? " (relocated block(s) still redirected; the cave is kept so they stay valid)" : "");
-        return bad == 0;
-    }
-
     if (m_RelocOn) { Log(false, "fill mode already on"); return true; }
     if (!Ready() || !m_Patched)
     { Fail("Fill mode needs the base fix applied first."); return false; }
@@ -1098,65 +1207,80 @@ bool chatlogfix::FillReloc(bool on)
     }
     n = (rows + 1 > k_ringMax) ? k_ringMax : rows + 1;
 
-
     // ---- PASS 1: resolve and verify every plain site before one byte is written -------------------
-    uintptr_t anch[RA_COUNT] = { 0 };
     uintptr_t addr[64] = { 0 };
     int       orig[64] = { 0 };
     for (size_t i = 0; i < k_ringN; ++i)
     {
         if (site_is_caved(k_ringSites[i])) continue;
         const uint8_t ai = k_ringSites[i].anchor;
-        if (anch[ai] == 0)
-        {
-            anch[ai] = Anchor(ai);
-            if (anch[ai] == 0)
-            { Fail("Fill mode: %s did not resolve uniquely - refusing (nothing was patched).",
-                   k_anchors[ai].name); return false; }
-        }
-        addr[i] = anch[ai] + k_ringSites[i].off;
+        const uintptr_t an = AnchorCached(ai);
+        if (an == 0)
+        { Fail("Fill mode: %s did not resolve uniquely - refusing (nothing was patched).",
+               k_anchors[ai].name); return false; }
+        addr[i] = an + k_ringSites[i].off;
         orig[i] = ring_read_at(addr[i], k_ringSites[i].kind);
         if (orig[i] != k_ringSites[i].stock)
         { Fail("Fill mode: %s+0x%X holds %d, expected %d - refusing (nothing was patched).",
                k_anchors[ai].name, k_ringSites[i].off, orig[i], k_ringSites[i].stock); return false; }
     }
 
-    // ---- PASS 2: the six relocations. They resolve and verify as a set, or nothing happens -------
-    if (!CaveInstall(n, n - 1)) return false;
+    // ---- PASS 2: the six relocations resolve and verify as a set, and the cave is built ---------
+    if (!CavePrepare(n, n - 1)) return false;
+    if (!Pin()) { VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr; return false; }   // never published
 
-    // ---- PASS 3: the plain sites --------------------------------------------------------------
-    for (size_t i = 0; i < k_ringN; ++i)
+    // ---- PASS 3: the jumps, then the plain sites, with every other thread stopped and out of the
+    //      chat code; the whole set rolls back on any failure ----------------------------------------
+    m_FillN = n;
+    int failBlock = -1, failAt = -1, rollbackLeft = 0;
+    const bool ran = Frozen([&]
     {
-        if (addr[i] == 0) continue;
-        m_RingAddr[i] = addr[i];
-        m_RingOrig[i] = orig[i];
-        const uint8_t k = k_ringSites[i].kind;
-        const int w = ring_want(k, n);
-        if (k == 3 || k == 2) { uint32_t v = static_cast<uint32_t>(w); WriteAt(addr[i], &v, 4); }
-        else if (k == 4 || k == 5) { uint16_t v = static_cast<uint16_t>(w); WriteAt(addr[i], &v, 2); }
-        else { uint8_t v = static_cast<uint8_t>(w); WriteAt(addr[i], &v, 1); }
-        if (ring_read_at(addr[i], k) != w)
+        for (int b = 0; b < BK_COUNT; ++b)
         {
-            for (size_t j = 0; j <= i; ++j)
-            {
-                if (m_RingAddr[j] == 0) continue;
-                const uint8_t kj = k_ringSites[j].kind;
-                if (kj == 2 || kj == 3) { uint32_t v = static_cast<uint32_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 4); }
-                else if (kj == 4 || kj == 5) { uint16_t v = static_cast<uint16_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 2); }
-                else { uint8_t v = static_cast<uint8_t>(m_RingOrig[j]); WriteAt(m_RingAddr[j], &v, 1); }
-                m_RingAddr[j] = 0;
-            }
-            const int left = CaveRemove();
-            m_RelocOn = (left > 0);
-            if (left == 0)
-                Fail("Fill mode: write failed at %s+0x%X - rolled back, nothing is patched.",
-                     k_anchors[k_ringSites[i].anchor].name, k_ringSites[i].off);
-            else
-                FailLoud("Fill mode: write failed at %s+0x%X, and %d relocated block(s) could not be restored - "
-                         "the cave is kept so they stay valid. Run " HL("/clf diag") " and report it.",
-                         k_anchors[k_ringSites[i].anchor].name, k_ringSites[i].off, left);
-            return false;
+            WriteAt(m_BlkSite[b], m_BlkPatch[b], k_blocks[b].len);
+            m_BlkAddr[b] = m_BlkSite[b];
+            uint8_t chk[32];
+            if (!safe_read(m_BlkSite[b], chk, k_blocks[b].len) || memcmp(chk, m_BlkPatch[b], k_blocks[b].len) != 0)
+            { failBlock = b; break; }
         }
+        if (failBlock < 0)
+        {
+            for (size_t i = 0; i < k_ringN; ++i)
+            {
+                if (addr[i] == 0) continue;
+                m_RingAddr[i] = addr[i];
+                m_RingOrig[i] = orig[i];
+                const uint8_t k = k_ringSites[i].kind;
+                const int w = ring_want(k, n);
+                ring_write_at(this, &chatlogfix::WriteAt, addr[i], k, w);
+                if (ring_read_at(addr[i], k) != w) { failAt = static_cast<int>(i); m_RingAddr[i] = 0; break; }
+            }
+        }
+        if (failBlock >= 0 || failAt >= 0)
+        {
+            rollbackLeft  = RestoreConstsIn();
+            rollbackLeft += RestoreBlocksIn();
+        }
+    });
+    if (!ran)
+    {
+        VirtualFree(m_Cave, 0, MEM_RELEASE); m_Cave = nullptr;   // never published
+        memset(m_RingAddr, 0, sizeof(m_RingAddr));
+        memset(m_BlkAddr, 0, sizeof(m_BlkAddr));
+        Fail("Fill mode: no moment without a game thread in the chat code came within a second - nothing was patched.");
+        return false;
+    }
+    if (failBlock >= 0 || failAt >= 0)
+    {
+        m_RelocOn = (rollbackLeft > 0);
+        const char* what = failBlock >= 0 ? k_blocks[failBlock].name : k_anchors[k_ringSites[failAt].anchor].name;
+        if (rollbackLeft == 0)
+            Fail("Fill mode: could not write %s - rolled back, nothing is patched.", what);
+        else
+            FailLoud("Fill mode: could not write %s, and %d site(s)/block(s) of the rollback did not take - "
+                     "left as they are (the cave is kept so they stay valid). Run " HL("/clf diag") " and report it.",
+                     what, rollbackLeft);
+        return false;
     }
 
     m_RelocOn = true;
@@ -1170,11 +1294,18 @@ bool chatlogfix::Apply(void)
 {
     if (m_Patched)
     {
-        const uint8_t a0 = *reinterpret_cast<volatile uint8_t*>(m_Site[0]);
-        const uint8_t b0 = *reinterpret_cast<volatile uint8_t*>(m_Site[1]);
-        if (a0 == k_target && b0 == k_target) return true;
-        Fail("Chatlogfix thinks it is on, but the sites read %d and %d instead of %d - something "
-             "overwrote our patch. Reload chatlogfix to re-take them.", a0, b0, k_target);
+        // Loaded again this session: this image's earlier load made these changes and unload left them in. They are
+        // taken back over when every site still holds what was written.
+        const int lost = Overwritten();
+        if (lost == 0)
+        {
+            Log(false, "took back over what its earlier load left in (base on, fill %s, serialization %s)",
+                m_RelocOn ? "relocated" : m_ConstOn ? "on" : "off", ChatSerial_Active() ? "on" : "off");
+            return true;
+        }
+        FailLoud("%d of the sites chatlogfix changed earlier this session hold something else now - another tool "
+                 "overwrote them. Restart the game to re-take them.", lost);
+        LogSiteBytes(true);
         return false;
     }
     if (!Ready() && !Resolve()) return false;
@@ -1197,32 +1328,51 @@ bool chatlogfix::Apply(void)
     }
     m_Orig[0] = cur[0];
     m_Orig[1] = cur[1];
+    m_BaseNow[0] = cur[0];
+    m_BaseNow[1] = cur[1];
+    if (!Pin()) return false;
 
-    for (int i = 0; i < 2; ++i)
+    // Both bytes with every other thread stopped and none inside the view-reset routine that reads
+    // them (a rebuild in flight would otherwise see one branch at 99 and the other at 50).
+    WriteInfo w[2] = {}, rw[2] = {};
+    int failed = -1;
+    bool rolled[2] = { true, true };
+    const bool ran = Frozen([&]
     {
-        WriteInfo w;
-        const bool ok = write_byte(m_Site[i], k_target, &w);
-        NoteWrite(i, w);
-        if (ok) { m_Dirty[i] = true; continue; }
-
-        if (w.code == WRITE_NO_ACCESS)
+        for (int i = 0; i < 2; ++i)
+        {
+            if (write_byte(m_Site[i], k_target, &w[i])) { m_Dirty[i] = true; m_BaseNow[i] = k_target; continue; }
+            failed = i;
+            for (int j = 0; j < i; ++j)
+            {
+                rolled[j] = write_byte(m_Site[j], m_Orig[j], &rw[j]);
+                if (rolled[j]) { m_Dirty[j] = false; m_BaseNow[j] = m_Orig[j]; }
+            }
+            break;
+        }
+    });
+    if (!ran)
+    { Fail("No moment without a game thread in the chat code came within a second - nothing was patched."); return false; }
+    for (int i = 0; i < 2 && (failed < 0 || i <= failed); ++i) NoteWrite(i, w[i]);
+    if (failed >= 0)
+    {
+        const int i = failed;
+        if (w[i].code == WRITE_NO_ACCESS)
             Fail("Could not make %s RVA 0x%06X writable (Windows error %u) - no change made.",
-                 k_sigs[i].name, Rva(m_Site[i]), w.err);
+                 k_sigs[i].name, Rva(m_Site[i]), w[i].err);
         else
             Fail("Wrote %d to %s RVA 0x%06X but it reads back %d - the write did not stick, so "
                  "another tool is holding this byte. Not patching.",
-                 k_target, k_sigs[i].name, Rva(m_Site[i]), w.got);
-
+                 k_target, k_sigs[i].name, Rva(m_Site[i]), w[i].got);
         for (int j = 0; j < i; ++j)
         {
-            WriteInfo rw;
-            const bool back = write_byte(m_Site[j], m_Orig[j], &rw);
-            NoteWrite(j, rw);
-            if (back) { m_Dirty[j] = false; continue; }
-            FailLoud("ROLLBACK FAILED - %s RVA 0x%06X is stuck at %d and chatlogfix cannot put it back "
-                 "(Windows error %u). Restart the game to clear it.",
-                 k_sigs[j].name, Rva(m_Site[j]), rw.got, rw.err);
+            NoteWrite(j, rw[j]);
+            if (!rolled[j])
+                FailLoud("ROLLBACK FAILED - %s RVA 0x%06X is stuck at %d and chatlogfix cannot put it back "
+                         "(Windows error %u). Restart the game to clear it.",
+                         k_sigs[j].name, Rva(m_Site[j]), rw[j].got, rw[j].err);
         }
+        m_Patched = m_Dirty[0] || m_Dirty[1];
         return false;
     }
 
@@ -1232,76 +1382,103 @@ bool chatlogfix::Apply(void)
     return true;
 }
 
-bool chatlogfix::Restore(void)
+// Unload leaves every change in place until the game closes: narrowing the ring back is safe only if no thread holds a
+// ring index anywhere up its call stack, and a thread pause sees only instruction pointers. What stays is self-contained
+// (the caves call no DLL code, the DLL is pinned), and the image keeps its record of it for a later /load to take back
+// over. This only records what stays. Idempotent.
+bool chatlogfix::TeardownAll(char* summary, size_t n)
 {
-    if (m_RelocOn && !FillReloc(false))
+    if (m_TornDown) return true;
+    m_TornDown = true;
+    const bool fill = m_ConstOn || m_RelocOn;
+    bool blocks = false;
+    for (int b = 0; b < BK_COUNT; ++b) blocks = blocks || m_BlkAddr[b] != 0;
+    const bool base = m_Dirty[0] || m_Dirty[1];
+    const bool serial = ChatSerial_SitesLeft() > 0;
+    if (!fill && !blocks && !base && !serial)
     {
-        FailLoud("The base fix was left applied too: its two bytes sit inside relocated code right "
-                 "now, and writing them would corrupt it. Zone or relog, then unload again.");
-        return false;
+        if (summary != nullptr) _snprintf_s(summary, n, _TRUNCATE, "nothing of chatlogfix's was in the game");
+        return true;
     }
-    for (int b = 0; b < BK_COUNT; ++b)
-        if (m_BlkAddr[b] != 0)
-        {
-            // A relocated block survived a failed install or teardown: the base-fix bytes lie inside
-            // the jmp it still holds, so writing them would corrupt the jmp. Leave everything as is.
-            FailLoud("The base fix was left applied too: a relocated block is still redirected and the two "
-                     "bytes sit inside it. Restart the game to clear it.");
-            return false;
-        }
-    if (m_ConstOn) FillConst(false);
-    if (!m_Dirty[0] && !m_Dirty[1]) return false;
-
-    bool allBack = true;
-    for (int i = 0; i < 2; ++i)
-    {
-        if (!m_Dirty[i]) continue;
-        const uint8_t cur = *reinterpret_cast<volatile uint8_t*>(m_Site[i]);
-        if (cur != k_target)
-            Log(true, "%s RVA 0x%06X reads %d before restore, not our %d - something else wrote it "
-                      "after we did. Restoring to %d anyway, so the byte is not left on a value nobody "
-                      "owns.", k_sigs[i].name, Rva(m_Site[i]), cur, k_target, m_Orig[i]);
-
-        WriteInfo w;
-        const bool back = write_byte(m_Site[i], m_Orig[i], &w);
-        NoteWrite(i, w);
-        if (back) { m_Dirty[i] = false; continue; }
-
-        allBack = false;
-        FailLoud("RESTORE FAILED - %s RVA 0x%06X still reads %d and chatlogfix cannot put it back "
-             "(Windows error %u). The client is running patched code. Restart the game to clear it.",
-             k_sigs[i].name, Rva(m_Site[i]), w.got, w.err);
-    }
-
-    m_Patched   = m_Dirty[0] || m_Dirty[1];
-    if (m_Patched) m_ToldHowToReport = false;
-    m_RestoreOk = allBack;
-    if (allBack) m_Fail[0] = '\0';
-    return allBack;
+    // Unload leaves every change in place until the game closes. Narrowing
+    // the ring back to stock is safe only if no thread holds a ring index anywhere up its call stack (a getter returning
+    // 110 to a caller whose loop then runs against modulus 100 never ends), and a thread freeze sees only instruction
+    // pointers, not what callers hold. What stays in is self-contained: the caves are process allocations that call no
+    // DLL code, the constants and base bytes are plain client arithmetic, and the DLL is pinned. So chat keeps working
+    // exactly as it did, and a restart gives the stock client back.
+    if (summary != nullptr)
+        _snprintf_s(summary, n, _TRUNCATE, "its changes stay in until the game closes (fill %s, base %s, serialization %s); a /load of this image takes them back over, a restart gives the stock chat code",
+                    fill ? "on" : "off", base ? "on" : "off", serial ? "on" : "off");
+    return true;
 }
 
 void chatlogfix::SerialLog(void* ctx, bool warn, const char* msg)
 {
     chatlogfix* self = reinterpret_cast<chatlogfix*>(ctx);
     if (self == nullptr) return;
-    if (warn) self->Print(k_colWarn, "%s", msg);
+    if (warn) self->Print(k_colWarn, "%s Details: " HL("%s") "%s", msg, self->LogShown().c_str(), self->LogNote());
     else      self->Log(false, "%s", msg);
 }
 
 bool chatlogfix::Initialize(IAshitaCore* core, ILogManager* logger, uint32_t id)
 {
     m_Core = core;
-    m_Log  = logger;
+    m_Log  = logger;   // unused: chatlogfix keeps its own log (plugin_log.h)
     m_Id   = id;
+
+    // The log first, so everything below - a refusal too - is in it. Lines are held until the writer starts (on a /load
+    // of an image that stayed mapped, its writer already ran once, and they go straight to the file instead).
+    m_Root = plog::ashitaRoot(&g_clfLog);
+    m_Run  = plog::thisRun();
+    g_clfLog.open(m_Root, plog::startupLogPath(m_Root, "chatlogfix", m_Run));
+    char ver[16], iface[16];
+    _snprintf_s(ver, sizeof(ver), _TRUNCATE, "%.1f", GetVersion());
+    _snprintf_s(iface, sizeof(iface), _TRUNCATE, "%.2f", GetInterfaceVersion());
+    const std::string session = plog::sessionText("chatlogfix", ver, plog::ownImageStamp(&g_clfLog),
+                                                  plog::imageStamp(GetModuleHandleA("FFXiMain.dll")), iface, m_Run);
+    g_clfLog.setSession(session, m_Run);
+    g_clfLog.write("info", session);
+
+    // One copy per client, and the lock belongs to the image. Once chatlogfix has written anything the image stays mapped
+    // until the game closes and keeps the lock, so a /load of it later in the session finds the lock already its own here
+    // and takes its earlier load's changes back over (Apply). Any other chatlogfix image finds the lock taken and is
+    // refused: it could not tell what this one owns.
+    const bool again = (m_Sole != nullptr);
+    if (!again)
+    {
+        char name[64];
+        _snprintf_s(name, sizeof(name), _TRUNCATE, "Local\\chatlogfix-sole-instance-%u", static_cast<unsigned>(GetCurrentProcessId()));
+        m_Sole = CreateMutexA(nullptr, TRUE, name);
+        if (m_Sole == nullptr || GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            if (m_Sole != nullptr) { CloseHandle(m_Sole); m_Sole = nullptr; }
+            m_Refused = true;
+            g_clfLog.start();
+            FollowCharacter();   // after login the refusal goes straight to the character's log
+            Print(k_colFail, "another copy of chatlogfix is loaded, or was earlier this session and stays until the game "
+                             "closes; restart the game to load this one.");
+            g_clfLog.stop();     // this instance gets no more callbacks: its writer ends here
+            m_Core = nullptr;
+            return false;
+        }
+    }
+    else
+    {
+        // The loader hands back the image that stayed mapped, whatever chatlogfix.dll is on disk now.
+        Log(false, "loaded again this session: the same image as the earlier load");
+        const uint32_t disk = file_stamp_of_self();
+        if (disk != 0 && disk != plog::ownImageStamp(&g_clfLog))
+            Print(k_colWarn, "This is the build loaded earlier this session; the chatlogfix.dll on disk is a different "
+                             "build and loads after a game restart.");
+    }
 
     if (Apply())
     {
         Usage();
-        Log(false, "applied %d -> %d at branch A RVA 0x%06X, branch B RVA 0x%06X "
+        if (!again) Log(false, "applied %d -> %d at branch A RVA 0x%06X, branch B RVA 0x%06X "
                    "(FFXiMain base 0x%08X, build 0x%08X, SizeOfImage 0x%08X)",
             k_stock, k_target, Rva(m_Site[0]), Rva(m_Site[1]),
             static_cast<unsigned>(m_Base), m_ImgStamp, m_ImgSize);
-        LogSiteBytes(false);
     }
     else
     {
@@ -1314,28 +1491,34 @@ bool chatlogfix::Initialize(IAshitaCore* core, ILogManager* logger, uint32_t id)
     // Serialize FFXiMain's chat append vs draw.
     // Independent of the fulllog fill; installs its own SIG-located lock or logs why it did not.
     ChatSerial_Install(&chatlogfix::SerialLog, this);
+    if (!m_Pinned) m_Pinned = ChatSerial_Pinned();   // chatserial pinned before its first write
 
+    // Every thread pause of chatlogfix is above: the writer thread starts only now.
+    g_clfLog.start();
+    const std::string root = m_Root;
+    const plog::Run run = m_Run;
+    g_clfLog.post([root, run]
+    {
+        plog::deleteFiles(root, { "logs\\chatlogfix\\chatlogfix.log", "logs\\chatlogfix\\chatlogfix.log.old", "logs\\chatlogfix_diag.log" });
+        plog::cleanupStartupFiles(root, "chatlogfix", run);
+    });
+    FollowCharacter();   // loaded after login: the log moves to the character now
     return true;
 }
 
 void chatlogfix::Release(void)
 {
-    ChatSerial_Remove();
-    if (m_RelocOn)  FillReloc(false);
-    if (m_ConstOn) FillConst(false);
-    if (!m_Dirty[0] && !m_Dirty[1])
-    {
-        Log(false, "released; nothing of ours was in the image.");
-        return;
-    }
-    if (Restore())
-    {
-        Log(false, "released; both sites restored to %d.", k_stock);
-        return;
-    }
-    Log(true, "RELEASED WITH THE PATCH STILL APPLIED - FFXiMain.dll still holds %d and no chatlogfix "
-              "instance owns it any more. Reload chatlogfix, or restart the game.",
-        k_target);
+    if (m_Refused) return;
+    char left[200] = "";
+    TeardownAll(left, sizeof(left));
+    Log(false, "unloaded; %s%s", left, plog::runSuffix(m_Run).c_str());
+    if (m_Pinned) Chat(k_colInfo, "unloaded; its changes stay in until the game closes, and " HL("/load chatlogfix") " takes them back over.");
+    // The writer stops last. A stalled share keeps it past 2 s: the DLL must then stay mapped.
+    if (!g_clfLog.stop() && !m_Pinned) m_Pinned = Pin();
+    // Pinned: the image, its record of what it wrote and the lock stay until the game closes, for a /load of it to take
+    // back over. Otherwise (nothing was ever written) the image unmaps, and the lock goes with it.
+    if (!m_Pinned && m_Sole != nullptr) { ReleaseMutex(m_Sole); CloseHandle(m_Sole); m_Sole = nullptr; }
+    m_Core = nullptr;
 }
 
 void chatlogfix::Status(bool full, bool terse)
@@ -1411,16 +1594,14 @@ void chatlogfix::Status(bool full, bool terse)
     }
 }
 
-bool chatlogfix::HandleCommand(int32_t mode, const char* command, bool injected)
+bool chatlogfix::Command(const char* command)
 {
-    UNREFERENCED_PARAMETER(mode);
-    UNREFERENCED_PARAMETER(injected);
-
     std::vector<std::string> args;
     Ashita::Commands::GetCommandArgs(command, &args);
     if (args.empty()) return false;
     if (_stricmp(args[0].c_str(), "/chatlogfix") != 0 && _stricmp(args[0].c_str(), "/clf") != 0)
         return false;
+    m_CmdOurs = true;
 
     const bool bare = (args.size() <= 1);
     const char* a = bare ? "status" : args[1].c_str();
@@ -1432,26 +1613,34 @@ bool chatlogfix::HandleCommand(int32_t mode, const char* command, bool injected)
     }
     else if (_stricmp(a, "diag") == 0)
     {
-        char path[MAX_PATH];
-        if (!DiagOpen(path, sizeof(path)))
-        {
-            Fail("Could not open the diagnostic file for writing - reporting to the Ashita log "
-                 "instead.");
-            Status(true);
-        }
-        else
-        {
-            Status(true);
-            DiagClose();
-            Print(k_colInfo, "Diagnostics written to " HL("logs\\chatlogfix_diag.log")
-                             " in your Ashita folder.");
-        }
+        DiagBegin();
+        Status(true);
+        DiagEnd();
     }
     else
     {
         Usage();
     }
     return true;
+}
+
+bool chatlogfix::HandleCommand(int32_t mode, const char* command, bool injected)
+{
+    UNREFERENCED_PARAMETER(mode);
+    UNREFERENCED_PARAMETER(injected);
+    m_CmdOurs = false;
+    try
+    {
+        return Command(command);
+    }
+    catch (...)
+    {
+        m_Diag = false;
+        if (!m_CmdOurs) return false;   // it failed before it was known to be ours: leave it to its owner
+        Log(true, "error: HandleCommand: an unexpected error");
+        Print(k_colFail, "the command failed with an unexpected error.");
+        return true;
+    }
 }
 
 // ------------------------------------------------------------------------------------------------

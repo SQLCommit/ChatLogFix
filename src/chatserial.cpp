@@ -1,12 +1,6 @@
-/**
- * chatserial - see chatserial.hpp. A recursive spinlock held by the chat append processor (writer)
- * and the chat draw (reader), serializing addon-thread chat against the main-thread draw.
- *
- * The cave is built by BuildChatLockCave() (chatserial_cave.hpp).
- *
- *   WRITER FUN_04508b80  entry sig 81 ec 6c 06 00 00 53 55 56 8b   exit `add esp,0x66C; ret 0x14`
- *   READER FUN_04517b10  entry sig 83 ec 20 53 56 8b f1 33 db 88   exits `add esp,0x20; ret 8` (x2)
- */
+// Serialize chat append and draw with a recursive spinlock.
+// Writer: entry 81 EC 6C 06 00 00 53 55 56 8B; exit add esp,0x66C; ret 0x14.
+// Reader: entry 83 EC 20 53 56 8B F1 33 DB 88; two exits add esp,0x20; ret 8.
 #include "chatserial.hpp"
 #include "chatserial_cave.hpp"
 #include "freeze.hpp"
@@ -20,8 +14,8 @@
 
 namespace
 {
-    const uint8_t k_sigWriter[]  = { 0x81,0xec,0x6c,0x06,0x00,0x00,0x53,0x55,0x56,0x8b }; // FUN_04508b80 entry
-    const uint8_t k_sigReader[]  = { 0x83,0xec,0x20,0x53,0x56,0x8b,0xf1,0x33,0xdb,0x88 }; // FUN_04517b10 entry
+    const uint8_t k_sigWriter[]  = { 0x81,0xec,0x6c,0x06,0x00,0x00,0x53,0x55,0x56,0x8b }; // writer entry
+    const uint8_t k_sigReader[]  = { 0x83,0xec,0x20,0x53,0x56,0x8b,0xf1,0x33,0xdb,0x88 }; // reader entry
     const uint8_t k_wexitPat[]   = { 0x81,0xc4,0x6c,0x06,0x00,0x00,0xc2,0x14,0x00 };       // add esp,0x66C ; ret 0x14
     const uint8_t k_rexitPat[]   = { 0x83,0xc4,0x20,0xc2,0x08,0x00 };                      // add esp,0x20  ; ret 8
 
@@ -47,8 +41,7 @@ namespace
     };
 
     uint8_t* g_cave = nullptr;
-    // saved = what a clean removal restores; installed = the jmp we wrote (removal only writes over
-    // exactly that); entry = an entry site (removal touches entries only, exits stay); done = restored.
+    // Restore only owned entry jumps; exit patches remain installed.
     struct Site { uintptr_t addr; uint8_t saved[5]; uint8_t installed[5]; bool entry; bool done; };
     Site     g_sites[5];
     int      g_nSites = 0;
@@ -79,9 +72,7 @@ namespace
     uintptr_t g_base = 0;
     uint32_t  g_writerRva = 0, g_readerRva = 0;
     uintptr_t g_went = 0, g_rent = 0;     // the writer/reader entries once resolved (kept after removal)
-    // The spans a thread must be out of while an entry or exit changes: the whole writer and reader
-    // bodies (the scan ranges used for the exits, a superset of the Sep-10 bodies 0x3A3 and 0x296) and
-    // the cave. A thread inside the body may hold the lock or sit on a stolen instruction.
+    // Freeze the full writer, reader and cave spans: a thread may hold the lock or a stolen instruction.
     const uint32_t k_writerSpan = 0x600, k_readerSpan = 0x400;
 
     void logf(ChatSerialLog log, void* ctx, bool warn, const char* fmt, ...)
@@ -145,9 +136,7 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }   // fault -> caller's count check fails -> aborts
     }
 
-    // An exit site is either the stock epilogue (pat) or, after a previous load whose drain timed out,
-    // a `jmp rel32` into a retained cave whose release stub ends in exactly that epilogue. Both count;
-    // the second is re-pointed at the new cave and restored to the STOCK bytes on a clean removal.
+    // Match stock epilogues or retained jumps whose release stubs end in the same epilogue.
     bool exit_site_ok(uintptr_t a, const uint8_t* pat, size_t len)
     {
         __try
@@ -225,18 +214,14 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
                         || memcmp(reinterpret_cast<const void*>(rexits[0]), k_rexitPat, sizeof(k_rexitPat)) != 0
                         || memcmp(reinterpret_cast<const void*>(rexits[1]), k_rexitPat, sizeof(k_rexitPat)) != 0;
 
-    // The exits are never restored at unload, so after the first load in a
-    // client session they already point into a cave a previous load left behind. That cave is
-    // ADOPTED -- same lock state, so a holder or waiter from before the reload keeps working -- if
-    // and only if its code is byte-for-byte what this builder emits for that address. Anything else
-    // there means a different build's cave, and nothing is installed rather than a second lock.
+    // Reuse retained exits only when the cave matches this builder byte-for-byte.
+    // Keep the same lock so existing holders and waiters remain synchronized.
     uint8_t* cave = nullptr; uintptr_t C = 0; std::vector<uint8_t> code; size_t off[4];
     if (repointed)
     {
         std::vector<uint8_t> probe; size_t poff[4];
         BuildChatLockCave(0, went, rent, probe, poff);              // offsets do not depend on C
-        // The cave is named by whichever exit is already a jmp (a failed install may have left only
-        // one). Every exit must then be EITHER stock (patch() writes it) OR a jmp to that cave's stub.
+        // A failed install may leave only one exit jump. All others must be stock or target the same cave.
         uintptr_t C0 = 0;
         if (jmp_target(wexit))          C0 = jmp_target(wexit)     - 16 - poff[2];
         else if (jmp_target(rexits[0])) C0 = jmp_target(rexits[0]) - 16 - poff[3];
@@ -270,7 +255,7 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
     }
     const uintptr_t ACQW = C + 16 + off[0], ACQR = C + 16 + off[1], RELW = C + 16 + off[2], REL8 = C + 16 + off[3];
 
-    // From the first byte written the DLL stays mapped for the life of the process (freeze.hpp).
+    // Pin the DLL before the first write; it remains mapped until process exit.
     g_pinned = PinThisModule();
     if (!g_pinned)
     {
@@ -283,8 +268,7 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
     {
         Site& s = g_sites[g_nSites];
         s.addr = addr;
-        // saved = what a clean removal restores. For an exit that is still a jmp from a previous
-        // load, that is the STOCK epilogue, not the jmp.
+        // Save stock epilogues for exit sites, including jumps retained from an earlier load.
         if      (addr == wexit)                            memcpy(s.saved, k_wexitPat, 5);
         else if (addr == rexits[0] || addr == rexits[1])   memcpy(s.saved, k_rexitPat, 5);
         else                                               memcpy(s.saved, reinterpret_cast<void*>(addr), 5);
@@ -298,9 +282,8 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
         ++g_nSites;
         return true;
     };
-    // The writes happen with every other thread stopped and none of them inside the writer, the
-    // reader or the cave: a 5-byte jmp over a 6-byte prologue, or over `sub esp; push ebx; push esi`,
-    // must never land under a thread part-way through those instructions. No logging in there.
+    // Freeze outside the writer, reader and cave before replacing instructions.
+    // No logging or allocation while other threads are suspended.
     CodeRange ranges[4]; size_t nr = 0;
     { uintptr_t lo, hi; if (ModuleRangeOf(reinterpret_cast<const void*>(&ChatSerial_Install), lo, hi)) ranges[nr++] = CodeRange{lo, hi}; }
     ranges[nr++] = CodeRange{C, C + 0x1000};
@@ -310,7 +293,7 @@ bool ChatSerial_Install(ChatSerialLog log, void* ctx)
     int stranded = 0;
     ran = WhenNoThreadIn(ranges, nr, 1000, [&]
     {
-        // Order matters: RELEASES first, ACQUIRES last.
+        // Install release stubs before acquire stubs.
         ok = patch(wexit, RELW) && patch(rexits[0], REL8) && patch(rexits[1], REL8)
           && patch(went, ACQW) && patch(rent, ACQR);
         // Same rule as removal: only ENTRY sites go back on failure, each verified; one that does not

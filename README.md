@@ -1,138 +1,90 @@
-# ChatLogFix v1.3 - Full-Height Chat Log + Chat Thread-Safety for Ashita v4
+<div align="center">
 
-Fills the expanded chat log (fulllog) to the full height of its window, and serializes FFXI's
-non-thread-safe chat, fixing the chat buffer corruption.
+# ![ChatLogFix](https://readme-typing-svg.demolab.com/?font=Cinzel&size=48&duration=900&pause=0&color=C49B53&center=true&vCenter=true&repeat=false&width=600&height=78&lines=ChatLogFix&letterSpacing=2px&weight=700)
 
-## Features
+**A fuller chat window and a fix for corrupted chat.**
 
-- **Base fix** - the fulllog rebuild stops at 50 lines; it now stops at 99, which fills any window up
-  to 1679px tall.
-- **Fill mode** - on taller windows, raises the chat ring itself to match the window, up to 200 records.
-- **Chat serialization** - one lock so chat is never written while the game is drawing or growing the
-  buffer.
+[![Final Fantasy XI](https://custom-icon-badges.demolab.com/badge/Final_Fantasy-XI-90703D?style=flat-square&logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAADAFBMVEUAAABAMDBQODhgQDhYQEBQSFBoSEBgSEBoSEhgSEhoSEBoSEBgSFBoSEhoSEBwSDhoSEBoSEhoSEBoSEBwSDhgUFBoUEh4SDh4SEBwUFB4UECASDhoUFhwUEhgWGBwUFB4UEh4UEhgWGBwWFiAUEh4UFBoWGBoYGCIUEiAWFBwYGB4WFiAWFCIWEhwYGB4WFiAWFiAWFiIWFCAYFhwYGiAYFiQWFB4YGh4YGCAYGCQWFiQYFB4aGiIYFiYWFiIYGiIYGCIYFB4aGiQYFiAaGiIYGCYYFiYYFCIaGiQYGCYYFiAaGiQaGCQaGCYYGCgYFCQaGCYaGiYaFiIcGigYFB4cHCQaGCIaGiYaGigaFCYaHCgaFiYaGCIcHCQcGigaGi4YFCAeICoaGCIeHiIeHCgcGCYcHCoaHCgaHCAeICgcGCoaGCwaFigcHCIeHiQeHCYeHCQeHCgcHCwaGiIgICYeHCYeHCwcHCQgIC4aGi4cFiocHigeHCoeGC4cFiYeHi4cFjAaGioeHCQgICYgHigeHiYgICweHi4eGCogHC4cHiweHC4eGCggICggHiYiICYiICwgHCYgIC4eICgiICogIDAeICYiIi4gIDIeHCgiIi4gHDQeGCgiIiwgHi4gHCwiICoiICokICgkIi4gHigkIioiIigkJDAiHjgeHCwiIiokIi4iIC4iHjIiHi4iIDIiHiwkIC4kHiomJCokJDAiICwkIjAkIDAkIDAkIComJCwmIjAkIDIkIC4kIjogIDIkIi4mJCwmJi4mJC4mJDogIiwmJjgkIDQmJC4oKDAoJC4oJjAoJDImJC4oKDokJC4qKDAoJjQmJjwkIjIoJDAoKDokJjQqJjAqKjIqKDIqKDQqKDIsKjIsKjgoJjIsKjQsKjIsLDIsKjQsKjgsKjQuKjIwLjYuLDQuLjosKjYuLDYuLDYuLDguLDYwLjQyMDYyLjoyLjoyMDg0Mjg0Mjg0Mjo0Mjo2NDg2Njw2Mjw2NDw4ODw4ODw6Oj4%2BPD4%2BPg4jpSBAAAAAXRSTlMAQObYZgAAAphJREFUeJxjYMABOubX1XVU4ZB8dv%2FumddPn3%2F%2Bik1BVc%2BVVx9%2B%2Ffn7%2Fd37Hx%2BxKWi4fvPvv99flhzccvLYLSwKGq7fOvbzx4vNU9oWTzm0EFNB5PXHh3p%2Ff7vYNqmtvr6%2BFENB5L7HN%2BZufv%2FlxvLVffVlEydgyG989PDY5i%2BZwRcPblk96WFnAZq8e9btG7t63yV7ZNccvHj64bI1O9EUWB95e6j38SwXL3%2F%2FtFMPP124vQFVXrfgzsnewxdcDP2t%2FLVTfr588eAEiry04%2BFjCzffCpa3MrTSVmuZUnPnzSUUeaOFq3sPP%2FYRdTVUVVbL2%2BzTt%2BfAXiR5Tr55Zyt63y00lClWlFc22dUb27ljBbIBXE33Znm%2FeGJr31ipKK9%2BqDmxb83WHCR5JofebT7Lr86096z0U9TeMjfPp3P7WiR5RvbevOQpW7Qt7Isrk6xWrU4ujJtXi6xfYk1FaN7JVh7z9JXOdt6HUya1dAe5Iylgnr06MfTk%2BvSj6el%2BtmHbeqeevxyji2xB6rIKk8WrDKuv7XeWlJxVOLV1YqqCGJIFboenOx1abKWWe77RSjMlz8Ym3EcYWb7g3tTe3lOW8R6TLSIELZq1tGzCVQSQg3Dhwl7LU92W0yZHxScpt%2Bmph3sESIkhKyid1Lfcx6e8Kzcq3i%2FWUs1jBooFQAWHt%2B2KZeUJbM%2FwjJ%2BVZuKdFibLy4Cq4PQCbVHb9PjzrnFFRblx2gZcKPIMjDePW%2FHwRAQqa66aZKPlra3Pwomm4IGPoKS8c4Sq51QTJSUtS25UC4ARvfScjqQOh7xXvbeWkpyeMRsDOuAUX6TDoaNTH6wsE6vuy4whz8DJKbLdLGFdv4ug6JLZGpjyICX8B%2BbszjcVEjLDlAcA2agImHWK4wMAAAAASUVORK5CYII%3D)](https://www.playonline.com/ff11us/)
+[![Ashita interface 4.30](https://custom-icon-badges.demolab.com/badge/Ashita_Interface-4.30-536B91?style=flat-square&logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGsklEQVR4nKxXf1CT9xl%2F8uYlgQoEXQyZhhJcqhxER4GmeHaacWttL0zwDsesbvaGzA1qtbc71ul2Z%2BvqfsnuWrubG1A9Zepg0tOeug5bZLGCJhIQKdKABAgSzI83P8mbvG%2Fy7N502PWWkFD6ufv%2BkXyf7%2Ft9vs%2Fz%2BX6%2Bz0MgIixm6PV6fkVp6a6nBCkt%2BalpDdXV1Ws8Hk%2FC6xe1%2BdDQEKGWrjht2LwFTaUa%2FLt8De54TDSt0WjWfiUOjI2N8RobGx%2BjKCrq%2FP59%2Bwou5BdhUNeLvtd%2Fi%2Fc3bsa3ln4ds%2Fhkk9FoTMgBAubBK3vrXnQ5naZvq9W%2F3L17d1FLS0sKy7KP5h9aLBKCYYA%2B9BsI9ejAGwjCLIZBRPBlZrN53m%2FPIabRuXPnxB63o%2FBnr%2B5frr99%2B%2FDBgwf1drvdoNFoiuacyFEoBtsfTLibBwygNY3ClZFhoDEM99lgv0KhCCfiABlr4t13m8sbGhr2T09NgKXzMgw9cMDL9QfX2KzWJrVafVQikaz1%2BXwpxmXpI5TdWuh2u8EeYsMXZz3X1peWHrPZbDyZTIbxHOBFiBAF27dvX3%2F0d4dv0IN3YQUwYOjphswf1IIwORkkEgkIBIKInV6vB7FYDEfefNPZ1Nx8pKCgILukpEQ1NWX2OByOt6qqvt8lk8lmKyoqmKgbxSJHXV3dN2csFqQutyH9QTuyM1MYDzqdjnE6nXjpzGkc6LiEw%2Fc%2Bwfb28wEej3d4cnJyYSSkaRotlmnwIAH8nCeAL1kRL5pQXFxMEiEWnqCmgDc%2BAt%2FIlgM%2F5IVVq1bpZTJZ1DUxHSgpKRn507E%2FmjLylEDKV8fdfA5py74G8vUbIT01FcIhFvoHR%2F3BAJ3V19fHW5ADO3funL0zaPzRL37fMA1JgoQd4MBLXwqhtAwghALIXf14it%2FvJ8VicXSyzScSAwMDUFtbe4PLbygUisuBOYQoO2KAxsNvHHJJpdLqzs5OQaw9Yl5DDj09PcmpqamZEGDh3x9r4aHNCiqVCqRSKbhcLsjMzIy67or2Wujs31omL17uaLhxo%2FuEUqmMrQmxPDMYDKBSFbd7XU7ECQrRQ0dO5%2FV6sWXHARwufA1NV29FImOxWJBl2UcRKCsr%2B2jPnj3LjUYj70u%2FBQzDgFKprDSNjX4hvC6XC99J24zvLdmKo%2B9fR6vVinfu3MHW1taIMz6fD0Ui0R%2BsVmtCb0HMFJAkyYkNcfN6hy%2Fr8eolBPGZKZ8gIPMnz8KSGRqyNz8N%2FCQyIkRrM3MAfAwcbzweLCgouMD9lwii3gLu9Fu%2BW6bisczy%2Btde%2F9gyaXw0p732IYgUSZD98zKwOWyfLxKSgLwwFBcqyZGRkfiiMR8HDAYDb%2BtThbqP3nk7dOb4n91btzzvtVomIynglO7US9uws70twofPEUYm4EX1pm8Nb9iwYd2i6oGhoSF4bl3eBUf%2FbQwxTCTv17WdSHvtGPQ7ccw48Nl1YwOR3x77OP7r4ml84bmNE8uWLT3S3d0dl3zzSnFubi4sX%2Ftk%2FdHTTePhcBDS09NhwzNquD8%2BDW5vAFZmZUNwlgKP0wa9hj74y1%2FPwfk3PgBmhvakC4SsyWSa93rHTcHcLcjPyf1pQ%2F0BDPpdSFEUXtd2Ie2zxxQgv9mMZw7UswKS%2F6vp6enFVURcsblySvTjsWOjsPfFPUAQBGStlALBT%2FqCXTAYANuDT8Excx%2BudnXA2UuX7JJMaS8nVouKwCt1ewu3Cb8TrE4pZ3%2B4qXIe3WXx1ZqXMIlPGjTCZ9wZooz9XC25KA5wGLh7V2CQmSrfE2qrWUnAHGYDUe2CfifkrVOE8pT5%2B3oEg4c2qTd1yOXyuJVQ3AhotVoel8e2tjaisuL5u56Hn%2F7f4VmGRmrKgPapQczPy2vctWuXUKfTLajXiGvAVTKr5FnnbaYedFkGkfbakKHd6HdbkDL3omPiFvqoCezv7w8UFRXVcr3CQhyIWRP%2BL9Rqtfp75eor2ys1ydEteEAK02B80sZu21FdOXTv3oVEM5BQ7X7y5Mmut4%2Bfren9xMySySKw2ii43TcYbj71D2ps3AyIYWADbsgIO0m35cELJpMp0f0Tb820Wi2%2FpqbmZjjEoGPiJqqK1nVVVVXlKBSKCpEo7derFfKmZ59%2BsjeJJF%2BO1Ul9KQ7MDb%2FfDyWqwlPuh8M43PtPFIvFNZxYzYkW14qdOHEiWavVkgvhQMKS6fV6gaYcKbdaW6Hp%2FasTGo3mQ%2B7Jhv8%2B3QqFght04rFfYAq4U2o0GqVQKKwtLy%2FPS1Rq443%2FBAAA%2F%2F%2BWk28F7WDfcAAAAABJRU5ErkJggg%3D%3D)](https://www.ashitaxi.com/)
+[![MIT License](https://custom-icon-badges.demolab.com/badge/License-MIT-90703D?style=flat-square&logo=law&logoColor=white)](LICENSE)
 
-Everything applies itself on load. There is nothing to configure.
+[![Download](https://custom-icon-badges.demolab.com/badge/Download-8A652F?style=for-the-badge&logo=download&logoColor=white)](https://github.com/SQLCommit/ChatLogFix/releases/latest)
+[![Changelog](https://custom-icon-badges.demolab.com/badge/Changelog-456487?style=for-the-badge&logo=history&logoColor=white)](CHANGELOG.md)
+[![Report an issue](https://custom-icon-badges.demolab.com/badge/Report_an_issue-596573?style=for-the-badge&logo=issue-opened&logoColor=white)](https://github.com/SQLCommit/ChatLogFix/issues)
 
-## Requirements
+</div>
 
-- Ashita 4.3.1.2 or later with plugin interface 4.30 - built against 4.3.1.2's SDK and tested on 4.3.2.1.
+---
 
-## Installation
+<p align="center">
+ChatLogFix fills unused space in the expanded chat log and prevents the chat-buffer race that can cause garbled text, blank lines, or crashes during bursts of chat.
+</p>
 
-Download `ChatLogFix-vX.Y_Interface-N.NN.zip` from [Releases](https://github.com/SQLCommit/ChatLogFix/releases) - the one whose
-`Interface-N.NN` matches your Ashita's plugin interface (each release's notes say which) - and extract it into your
-Ashita folder. It adds `chatlogfix.dll` to `plugins\` and its docs to `docs\chatlogfix\`. GitHub's
-"Source code" zip is not the plugin. Then:
+## ![Install](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Install&letterSpacing=0.5px&weight=700)
 
-```
-/load chatlogfix
-```
+Developed with **Ashita v4.3.1.2**, plugin interface **4.30**.
 
-Add `/load chatlogfix` to your startup script to have it every session.
+1. [Download latest release of ChatLogFix](https://github.com/SQLCommit/ChatLogFix/releases/latest). Choose the plugin ZIP whose `Interface-N.NN` matches your Ashita plugin interface; GitHub's source-code ZIP does not include the DLL.
+2. Extract into `/ashita/`. The plugin should be at `/ashita/plugins/chatlogfix.dll`.
+3. In game, run `/load chatlogfix`.
 
-## Commands
+**Load automatically:** Add `/load chatlogfix` to your startup script in `/ashita/scripts/`.
 
-| Command | Description |
-|---------|-------------|
-| `/chatlogfix status` | What it is doing right now |
-| `/chatlogfix diag` | Write a full report to your character's log |
+Tested on Ashita **v4.3.2.1**. The fixes apply on load; there are no settings to configure.
 
-`/clf` for short.
+## ![Features](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Features&letterSpacing=0.5px&weight=700)
 
-## How it works
+**Full-height expanded log**
+FFXI rebuilds the expanded chat log with only 50 lines, even though its display ring holds 100 records. That leaves empty space after opening the log, switching tabs, or zoning, until new chat fills it. ChatLogFix raises the rebuild limit to 99 so the available history fills the window immediately.
 
-FFXI keeps chat in three layers:
+**Fill mode for taller windows**
+When the window needs more than 99 rows, the plugin also expands the display ring, up to the client's 200-record allocation. It measures the viewport on load and chooses the required capacity automatically.
 
-- a **store** of retained history, backed by 20 page files per window on disk
-- a 100-record **ring** holding what is currently on screen
-- the **view** you scroll
+| Full-height log | Rows filled with ChatLogFix |
+| :--- | :--- |
+| 1080p / 1440p | 62 / 85 — base fix is enough |
+| 4K / 5K | 130 / 175 — fill mode expands the ring |
 
-### Base fix
+The rebuild can display at most **199 lines**. Extremely tall windows can still have blank rows; the plugin cannot display history that has not been recorded yet.
 
-Every time the view resets - opening fulllog, switching tab, zoning - the ring is cleared and rebuilt
-from the store. The rebuild accumulates a running line count and stops once it reaches 50, so half the
-window is left empty. The gap fills in on its own as new chat arrives, which is why the bug feels
-intermittent and is always worst right after you open or tab.
+**Chat corruption fix**
+Chat arrives on a background thread while the main thread draws it. A burst of colored text can grow the buffer during a draw, causing garbled or blank lines and crashes. ChatLogFix makes those operations take turns, preventing this specific buffer race.
 
-The fix is one byte in each of the two branches of the view-reset:
+**With ChatHistoryPlus:** ChatLogFix fixes the visible log and its buffer access. ChatHistoryPlus increases how much older chat is retained for scrolling. They address different parts of the chat system.
 
-```
-cmp  dx, 50        ->        cmp  dx, 99
-```
+## ![Commands](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Commands&letterSpacing=0.5px&weight=700)
 
-Those two bytes stay in until the game closes (see Unloading).
+| Command | Action |
+| :--- | :--- |
+| `/clf status` | Show which fixes are active |
+| `/clf diag` | Write a diagnostic report to your character's log |
 
-### Fill mode
+`/chatlogfix` also works as the command prefix.
 
-The base fix fills the ring to its capacity of 100 records, which completely fills any chat window of
-99 rows or fewer. A taller window is taller than the ring can fill: at 4K that is 130 rows against 99
-records, leaving 31 blank rows above the oldest line. Fill mode raises the ring itself to match the
-window, up to **200 records**.
+## ![Updates and unloading](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Updates+and+unloading&letterSpacing=0.5px&weight=700)
 
-Your chat window holds `(viewport height / 16) - 5` rows. The plugin measures and decides; the chart
-is here so you can check it did the right thing.
+**Unloading does not remove the fixes.** They remain until FFXI closes. Loading again in the same session resumes the same copy; installing a new DLL or returning to stock chat requires a full game restart.
 
-| Display | Window holds | Stock | Base fix alone | + fill mode |
-|---------|-------------:|------:|---------------:|-------------:|
-| 1080p (1080) | 62 rows | 50, **12 blank** | **62 - full** | declines |
-| 1200p (1200) | 70 rows | 50, **20 blank** | **70 - full** | declines |
-| 1440p (1440) | 85 rows | 50, **35 blank** | **85 - full** | declines |
-| 1600p (1600) | 95 rows | 50, **45 blank** | **95 - full** | declines |
-| 1680 | 100 rows | 50, 50 blank | 99, **1 blank** | **100 - full** |
-| 2112 | 127 rows | 50, 77 blank | 99, 28 blank | **127 - full** |
-| 4K (2160) | 130 rows | 50, 80 blank | 99, 31 blank | **130 - full** |
-| 5K (2880) | 175 rows | 50, 125 blank | 99, 76 blank | **175 - full** |
-| 8K (4320) | 265 rows | 50, 215 blank | 99, 166 blank | 199, **66 blank** |
+After a game update, check `/clf status`. If a patch no longer matches the client, the plugin reports it rather than applying that patch.
 
-| Viewport height | What happens |
-|-----------------|--------------|
-| up to **1679px** | the base fix already fills the window; fill mode declines. |
-| **1680 - 3279px** | fill mode engages and fills the window exactly. |
-| **3280px and up** | fill mode engages but stops at 199 lines; some rows stay blank. |
+## ![Logs and support](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Logs+and+support&letterSpacing=0.5px&weight=700)
 
-That 199 cap is a hard one: 200 records is the size of the client's own ring allocation, and there is
-no larger number that is safe to write.
+- Run `/clf diag` and include the log when [reporting a problem](https://github.com/SQLCommit/ChatLogFix/issues).
+- **Files:** `/ashita/logs/chatlogfix/<Name>_<id>/chatlogfix.log`
+- Before login, logs go to `/ashita/logs/chatlogfix/` and move into the character's log after login. Each log retains its newest 1 MB.
 
-**How it reaches past 127.** Six blocks of client code hold the ring's bound in a sign-extended 8-bit
-immediate, so 127 is the largest number that fits. Below that it writes constants and nothing else
-happens. At 128 and above it re-encodes those six blocks with 32-bit immediates in a block of memory it
-allocates, and replaces each original site with a jump to it. Four of the six wrap or normalise a ring
-index; the other two are the rebuild's own stop value, which is what decides how many lines a rebuild
-places. It takes the cheaper mechanism whenever that reaches, then says what it did. Every site is
-checked against its expected bytes before anything is written, and the whole set rolls back if any single
-write does not take. The allocated block is never released: it stays, with the rest of ChatLogFix's
-changes, until the game closes (see Unloading).
+For source builds, see [Build instructions](BUILD.md).
 
-### Chat serialization
+## ![Changelog](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Changelog&letterSpacing=0.5px&weight=700)
 
-Every bit of color in FFXI chat is an escape code stored in the chat buffer, so a burst of
-heavily-colored text fills that buffer fast. Chat is written to it on a **background thread** while the
-game's **main thread is drawing the same buffer every frame**. When a write lands in the middle of the
-game's own work on that buffer - drawing it, or growing it to hold more - it corrupts: the client
-crashes, or lines render garbled or blank.
+See the [changelog](CHANGELOG.md) for new features, improvements, and fixes in each release.
 
-The plugin puts a lock on the buffer, so the two threads take turns and only one touches it at a time.
-It can't be corrupted mid-write, and both the crash and the garble stop. If a game update moves the code
-it patches, serialization turns itself off, says so in chat, and everything else keeps working.
+---
 
-### Files
+## ![Thanks and credits](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Thanks+and+credits&letterSpacing=0.5px&weight=700)
 
-The log is one file per character:
-`logs\chatlogfix\<Name>_<id>\chatlogfix.log` in the Ashita folder.
-Before you log in it writes to a startup file in `logs\chatlogfix\`, which moves into your character's log at
-login. Each log keeps its newest 1 MB; older lines are trimmed away. Several game clients can run from one Ashita folder
-at once without losing a line.
+- **The Ashita team** — atom0s, Thorny, and the [Ashita community](https://discord.gg/Ashita).
 
-`/clf diag` writes a full report into your character's log. If something goes wrong, run it and send that log.
+## ![License](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=License&letterSpacing=0.5px&weight=700)
 
-## Version history
-
-See [CHANGELOG.md](CHANGELOG.md).
-
-## Thanks
-
-- **The Ashita Team** - atom0s, thorny, and the Ashita Discord community
-
-## License
-
-MIT - see **LICENSE**.
+**ChatLogFix is free and open source under the [MIT License](LICENSE).**

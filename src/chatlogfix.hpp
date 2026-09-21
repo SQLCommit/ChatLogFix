@@ -1,9 +1,4 @@
-/**
- * chatlogfix - fills the expanded chat log (fulllog) to the full height of its window (the base fix,
- * plus fill mode for windows taller than 99 rows), and serializes the client's chat append against its
- * chat draw with a recursive spinlock (chatserial) so a colored-text flood can no longer corrupt the
- * chat buffer.
- */
+// ChatLogFix expands the chat-window fill limit and serializes chat append against draw.
 #define HL(s) "\x11" s "\x12"
 
 #ifndef CHATLOGFIX_HPP_INCLUDED
@@ -61,10 +56,7 @@ class chatlogfix final : public IPlugin
     bool         m_ToldHowToReport;
     char         m_Fail[256];
 
-    // What chatlogfix has written into the client, and where, belongs to the IMAGE, not to one load: these are static
-    // (defined in chatlogfix.cpp). Unload leaves every change in, and once anything is written the DLL is pinned, so a
-    // /load later in the session gets this same image back, finds its earlier load's changes recorded here, and takes
-    // them back over (Apply).
+    // Patch ownership is image-wide: unload retains patches, and reload adopts them from this pinned DLL.
     static uintptr_t m_Site[2];      // resolved addresses of the two imm8 bytes we patch
     static uint8_t   m_Orig[2];      // their stock values, captured before the first write
     static bool      m_Patched;
@@ -92,9 +84,8 @@ class chatlogfix final : public IPlugin
     static uint8_t   m_BaseNow[2];             // what we last wrote at the two base sites (ownership check)
     static int       m_FillN;                  // the ring size the constants currently hold (127 or m_RelocN)
 
-    // Unload safety (freeze.hpp): the DLL pins itself before its first write, and every code write happens with every
-    // other thread stopped and out of the chat code. The one-copy lock belongs to the image too: a /load of this image
-    // takes back over, and any other chatlogfix image is refused.
+    // Pin before the first write; freeze outside chat code for every patch. Retain the image
+    // and its instance lock so another DLL cannot adopt patches it does not own.
     bool      m_Refused  = false;
     bool      m_TornDown = false;
     static bool      m_Pinned;
@@ -110,8 +101,7 @@ class chatlogfix final : public IPlugin
         const size_t n = CollectRanges(r, 48);
         return WhenNoThreadIn(r, n, 1000, act);
     }
-    // Write-only steps for inside a frozen pass: no logging, no allocation. Each returns how many
-    // sites did NOT end up as intended (a foreign byte is left alone and counts).
+    // Frozen write helpers: no allocation or logging. Return the number of failed or foreign sites.
     int  RestoreConstsIn(void);
     int  RestoreBlocksIn(void);
     int  WriteBaseIn(uint8_t value);
@@ -140,7 +130,7 @@ class chatlogfix final : public IPlugin
     void Log(bool warn, const char* fmt, ...);
     static void SerialLog(void* ctx, bool warn, const char* msg);
 
-    // The log (plugin_log.h): one file per character, the diag report inside it.
+    // Per-character log.
     std::string m_Root;                  // the Ashita folder
     plog::Run   m_Run;                   // this run of the game: the run tag on the session and unload lines
     std::string m_CharKey;               // the character the log follows; "" before login
@@ -188,7 +178,7 @@ public:
 
     bool Initialize(IAshitaCore* core, ILogManager* logger, uint32_t id) override;
     void Release(void) override;
-    // UseDirect3D makes Ashita call this, and the SDK's default returns false: the load then fails "for Direct3D".
+    // UseDirect3D requires this override; the SDK default rejects initialization.
     bool Direct3DInitialize(IDirect3DDevice8*) override { return true; }
     bool HandleCommand(int32_t mode, const char* command, bool injected) override;
     void Direct3DPresent(const RECT*, const RECT*, HWND, const RGNDATA*) override;

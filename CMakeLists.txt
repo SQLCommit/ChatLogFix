@@ -1,14 +1,5 @@
-####################################################################################################
 # chatlogfix - Ashita v4 plugin (32-bit).
-#
-# Fills the expanded chat log (fulllog) to the full height of its window instead of stopping halfway.
-#
-# Configure (from a Windows box, x86 toolset; ASHITA4_SDK_PATH must point at a folder with Ashita.h):
-#   cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 -DCMAKE_BUILD_TYPE=Release
-#   cmake --build build --config Release
-#
-# Output: build/Release/chatlogfix.dll  ->  copy to Ashita-v4beta-main/plugins/
-####################################################################################################
+# Fills the expanded chat log and serializes chat-buffer access.
 cmake_minimum_required(VERSION 3.22)
 
 project(chatlogfix LANGUAGES CXX)
@@ -38,7 +29,7 @@ ashita_sdk_set_compiler_defaults(chatlogfix)
 ashita_sdk_set_linker_defaults(chatlogfix)
 ashita_sdk_set_compiler_warn_level(chatlogfix 3)
 
-# Do NOT enable Safe-SEH -- the legacy Direct3D8 import libs are not /SAFESEH-compatible.
+# Legacy Direct3D8 import libraries are not Safe-SEH compatible.
 
-# Emit a linker MAP so a crash address can be turned into a function name instead of a guess.
+# Emit a linker map for crash diagnostics.
 target_link_options(chatlogfix PRIVATE "/MAP" "/MAPINFO:EXPORTS")

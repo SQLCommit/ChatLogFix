@@ -1,9 +1,4 @@
-/**
- * freeze - every byte written into the client goes in or out only
- * while every other thread of the process is suspended and none
- * of them is inside the code being changed, and the DLL pins itself before its first write so no
- * thread can ever return into an unmapped image.
- */
+// Freeze threads outside patched code before writes; pin the DLL before the first patch.
 #ifndef CHATLOGFIX_FREEZE_HPP_INCLUDED
 #define CHATLOGFIX_FREEZE_HPP_INCLUDED
 
@@ -14,11 +9,8 @@
 // A span of code no other thread may be running while bytes in it change: [lo, hi).
 struct CodeRange { uintptr_t lo = 0, hi = 0; };
 
-// Every other thread of this process, suspended until destruction. Threads are walked with
-// NtGetNextThread, which hands out handles without allocating (a suspended thread may hold the heap
-// lock), and the walk repeats until a pass finds no thread it does not already hold. Anything that
-// cannot be established -- a thread that cannot be opened or suspended, too many threads, a walk that
-// does not settle -- makes the freeze incomplete, and anyInRanges() then reports every range occupied.
+// Enumerate with NtGetNextThread to avoid allocating under a frozen heap lock.
+// Repeat until no new thread appears; incomplete enumeration or suspension fails closed.
 class ThreadFreeze
 {
 public:
@@ -46,7 +38,7 @@ public:
                 const DWORD id = GetThreadId(next);
                 if (id == self || holds(id)) { current = next; continue; }
                 if (count_ == kMaxThreads) { current = next; complete_ = false; break; }
-                // An exited thread whose object another handle keeps alive is still walked, and SuspendThread refuses it. It runs nothing: skip it.
+                // An exited thread may still have a handle; skip it when SuspendThread refuses.
                 { DWORD code = 0; if (GetExitCodeThread(next, &code) && code != STILL_ACTIVE) { current = next; continue; } }
                 if (SuspendThread(next) == DWORD(-1)) { DWORD code = 0; if (GetExitCodeThread(next, &code) && code != STILL_ACTIVE) { current = next; continue; } current = next; complete_ = false; break; }
                 Thread& t = threads_[count_++];
@@ -103,9 +95,8 @@ private:
     bool complete_ = true;
 };
 
-// Runs `act` with every other thread suspended, at a moment when none of them is in `ranges`: tries
-// up to `attempts` times, 1 ms apart. `act` must not allocate, log, or take a lock another (suspended)
-// thread may hold. Returns whether `act` ran.
+// Try up to attempts quiet freezes, 1 ms apart. act must not allocate, log
+// or acquire a lock held by a suspended thread.
 template <class Act>
 inline bool WhenNoThreadIn(const CodeRange* ranges, size_t n, int attempts, Act&& act)
 {
@@ -135,8 +126,7 @@ inline bool ModuleRangeOf(const void* addr, uintptr_t& lo, uintptr_t& hi)
     return true;
 }
 
-// Pins this DLL for the life of the process. Called before the first byte goes into the client: from
-// then on a thread caught between a patched site and this code can never reach unmapped memory. Checked.
+// Pin before the first client patch so hooks and return addresses remain mapped.
 inline bool PinThisModule()
 {
     HMODULE self = nullptr;

@@ -1,15 +1,19 @@
 # Changelog
 
-## 1.3
+[Back to ChatLogFix](README.md)
+
+## v1.3
 
 ### Logs
+
 - **One log per character**, `logs\chatlogfix\<Name>_<id>\chatlogfix.log`; lines from before login move into it at login.
-- **Each log keeps its newest 1 MB**; no `.old` files.
+- **Each log keeps its newest 1 MB**.
 - **`diag` writes its report into your character's log** instead of a separate file.
 - Every failure says so once in chat and names the log.
 - The update deletes the old files: `logs\chatlogfix\chatlogfix.log`, `logs\chatlogfix\chatlogfix.log.old` and `logs\chatlogfix_diag.log`.
 
 ### Unloading
+
 - **Unload leaves ChatLogFix's changes in place until the game closes.** Putting the chat ring back to its stock size
   is safe only if no game thread holds a ring index anywhere up its call stack, and pausing threads cannot see that (a
   routine that returns index 110 to a loop that then runs against the stock size of 100 never finishes). Everything that
@@ -20,6 +24,7 @@
   of ChatLogFix is refused.
 
 ### Safety
+
 - **Every change to the game's code is made with the game's other threads paused,** at a moment when none of them is
   inside the chat code, either added memory block, or ChatLogFix itself. If no such moment comes within a second, the
   change is refused and reported.
@@ -28,7 +33,7 @@
 - The thread pause skips threads that have already exited (one kept alive by another handle used to make every pause fail).
 - `/clf diag` no longer reports chat serialization as active after a failed install.
 
-## 1.2
+## v1.2
 
 Adds **chat serialization**: the client's chat buffer is written from one thread while the main
 thread draws it, and a burst of colored text can make the buffer grow mid-draw. One recursive
@@ -40,7 +45,7 @@ and the garbled/blank chat lines.
 - The relocated-block cave is freed only when every block reads back as stock; a surviving block keeps
   the cave and blocks the base-fix restore, instead of leaving a jump into freed memory.
 
-## 1.1
+## v1.1
 
 Adds **fill mode**, which fills chat windows taller than the base fix can reach. The base fix is
 unchanged - the same two bytes, resolved the same way.
@@ -82,6 +87,6 @@ unchanged - the same two bytes, resolved the same way.
 - **Two commands: `status` and `diag`.**
 - `diag` writes to **`logs\chatlogfix_diag.log`**.
 
-## 1.0
+## v1.0
 
 Initial release.

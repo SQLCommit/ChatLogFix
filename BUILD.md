@@ -1,34 +1,46 @@
-# Building chatlogfix
+# Building
 
-A prebuilt `plugins/chatlogfix.dll` is included, so you only need this if you want to change something.
+[Back to ChatLogFix](README.md)
+
+For normal installation, download the plugin ZIP from the release page. These steps are for building the source.
 
 ## Requirements
 
-- Windows, Visual Studio 2022 with the **x86** toolset (Ashita plugins are 32-bit)
-- CMake 3.22+
-- The Ashita v4 SDK — a folder containing `Ashita.h`
+- Windows with Visual Studio 2022 and its C++ tools.
+- CMake 3.22 or newer.
+- The Ashita v4 SDK folder containing `Ashita.h`.
 
 ## Build
 
-Point `ASHITA4_SDK_PATH` at the SDK, then:
+From the project folder in Command Prompt:
 
-```
+```bat
 set ASHITA4_SDK_PATH=C:\path\to\ashita-sdk
 cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
-Output: `build\Release\chatlogfix.dll` — copy it into `Ashita-v4beta-main\plugins\`.
+CMake builds for **32-bit x86** and writes `build\Release\chatlogfix.dll`.
 
-**`-A Win32` is required.** A 64-bit build will compile and then fail to load, because the FFXI client
-and Ashita are both 32-bit.
+Fully close FFXI before replacing `/ashita/plugins/chatlogfix.dll`, then relaunch and load the plugin.
 
-Safe-SEH is deliberately left off; the legacy Direct3D8 import libraries are not `/SAFESEH`-compatible.
-A linker `.map` is emitted so a crash address can be resolved to a function name.
+## Release documentation
+
+Edit the root `README.md` for GitHub. Both release workflows generate a plain Markdown `docs/chatlogfix/README.md` inside the ZIP: badges become links, image headings become text, and feature dropdowns are expanded. The source README stays unchanged.
+
+To preview the packaged README in PowerShell:
+
+```powershell
+./.github/scripts/export-readme.ps1 -Output build/README.release.md
+```
+
+The README is read from the revision being packaged. Documentation edits need to be included in that revision before preparing its release files; existing ZIPs do not update automatically.
 
 ## If the signatures stop matching
 
-The two patch sites are found by scanning `FFXiMain.dll` for these 23-byte patterns, taking the byte
+This section covers the base expanded-log fix. Fill mode and chat serialization have additional checks in the source; these two patterns do not verify the entire plugin.
+
+The two base-fix patch sites are found by scanning `FFXiMain.dll` for these 23-byte patterns, taking the byte
 immediately after each:
 
 ```

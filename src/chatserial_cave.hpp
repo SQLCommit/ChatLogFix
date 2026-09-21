@@ -1,20 +1,8 @@
-/**
- * chatserial_cave - pure construction of the recursive-spinlock cave CODE (no Windows deps), so it can
- * be built and proven on any host.
- *
- * Cave layout: [owner:u32 @C+0][count:u32 @C+4][waiters:u32 @C+8][pad @C+12][code @C+16].
- * This builds only the code.
- *   went/rent = writer/reader entry addresses.
- *   stubOff[0..3] = offsets into `code` of ACQ_writer, ACQ_reader, REL_writer, REL_ret8
- *                   (absolute stub address = C + 16 + stubOff[i]).
- * `waiters` counts threads between stub entry and acquisition -- incremented by the stub's FIRST
- * instruction, so a thread that has jumped in is counted before it can do anything else -- and
- * removal waits until nobody is inside the acquire path before it restores the exits (a spinner that
- * wins the lock after the exits are stock would never release it). The release stub is
- * [push edx][mov edx,fs:[0x24]][cmp][pop edx][jne][dec count][jnz][mov owner,0] = 35 bytes, then the
- * replicated exit; ChatSerial_Install relies on that length to recognise an exit left redirected
- * into a retained cave by a previous load.
- */
+// Build the recursive-spinlock stubs without platform dependencies.
+// Layout: owner at C, depth at C+4, waiters at C+8, code at C+16.
+// went/rent are writer/reader entries; stubOff holds offsets of the two acquire and two release stubs.
+// Acquire counts waiters before attempting the lock. Release checks thread ownership.
+// The 35-byte release prefix is used to recognize retained exit stubs.
 #ifndef CHATSERIAL_CAVE_HPP_INCLUDED
 #define CHATSERIAL_CAVE_HPP_INCLUDED
 
@@ -31,8 +19,7 @@ inline void BuildChatLockCave(uintptr_t C, uintptr_t went, uintptr_t rent,
     auto put32 = [&](uint32_t v)
     { code.push_back(v & 0xFF); code.push_back((v>>8)&0xFF); code.push_back((v>>16)&0xFF); code.push_back((v>>24)&0xFF); };
 
-    // recursive acquire: (fs thread-id) recursive check -> lock cmpxchg -> inc count -> replicated
-    // stolen prologue -> jmp back into the function after the 5 stolen bytes.
+    // Acquire recursively by thread ID, replay the stolen prologue, then return to the function.
     auto emit_acquire = [&](std::initializer_list<uint8_t> repl, uintptr_t back)
     {
         code.push_back(0xf0); code.push_back(0xff); code.push_back(0x05); put32((uint32_t)WAITERS); // lock inc [waiters] -- FIRST
@@ -53,8 +40,7 @@ inline void BuildChatLockCave(uintptr_t C, uintptr_t went, uintptr_t rent,
         const uintptr_t jp = CODE + code.size() + 4;                                         // addr after the jmp (code at C+16)
         put32((uint32_t)(back - jp));                                                        // jmp back
     };
-    // recursive release, OWNER-CHECKED.
-    // Holder: dec count -> if zero clear owner -> replicated cleanup + ret.
+    // Only the owning thread releases; clear the owner at zero depth, then replay the exit.
     auto emit_release = [&](std::initializer_list<uint8_t> tail)
     {
         code.push_back(0x52);                                                                // push edx
